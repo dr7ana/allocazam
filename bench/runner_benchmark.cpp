@@ -305,18 +305,18 @@ namespace {
 
     struct dynamic_pool_state {
         explicit dynamic_pool_state(size_t bytes) : pool(bytes) {}
-        allocazam::pool::run_allocator<true, true> pool;
+        allocazam::runner::allocator<true, true> pool;
     };
 
     struct fixed_pool_state {
         explicit fixed_pool_state(size_t bytes) : pool(bytes) {}
-        allocazam::pool::run_allocator<false, true> pool;
+        allocazam::runner::allocator<false, true> pool;
     };
 
     struct noheap_pool_state {
         explicit noheap_pool_state(size_t bytes) : backing(bytes), pool(std::span<std::byte>{backing}) {}
         std::vector<std::byte> backing;
-        allocazam::pool::run_allocator<false, true> pool;
+        allocazam::runner::allocator<false, true> pool;
     };
 
     constexpr std::string_view workload_label_for_table(std::string_view workload) noexcept {

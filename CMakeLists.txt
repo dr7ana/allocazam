@@ -19,9 +19,6 @@ add_library(liballocazam
 target_include_directories(liballocazam PUBLIC lib)
 target_compile_features(liballocazam PUBLIC cxx_std_23)
 
-add_executable(allocazam src/main.cpp)
-
-target_link_libraries(allocazam PUBLIC liballocazam)
 
 add_subdirectory(bench)
 add_subdirectory(tests)

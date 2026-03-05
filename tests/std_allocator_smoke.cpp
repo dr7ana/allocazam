@@ -1,3 +1,4 @@
+#include "allocazam.hpp"
 #include "utils.hpp"
 
 #include <deque>

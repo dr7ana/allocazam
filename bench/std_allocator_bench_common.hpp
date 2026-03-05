@@ -1,11 +1,12 @@
 #pragma once
 
-#include "utils.hpp"
+#include "allocazam.hpp"
 
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <iomanip>
+#include <iostream>
 #include <numeric>
 
 namespace allocazam_bench {

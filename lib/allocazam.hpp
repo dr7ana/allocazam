@@ -7,8 +7,6 @@
 
 namespace allocazam {
     //
-    enum class memory_mode : uint8_t { fixed, dynamic, noheap };
-
     template <memory_mode Mode>
     concept fixed_mode = Mode == memory_mode::fixed;
 
@@ -23,10 +21,6 @@ namespace allocazam {
 
     template <memory_mode Mode>
     concept fixed_like_mode = fixed_mode<Mode> || noheap_mode<Mode>;
-
-    namespace detail {
-        size_t detect_page_size() noexcept;
-    }  // namespace detail
 
     template <typename T, memory_mode Mode = memory_mode::fixed>
     class allocazam {
@@ -278,7 +272,7 @@ namespace allocazam {
     template <typename T>
     struct alignas(detail::cache_line_size) allocazam_std_state<T, memory_mode::fixed> {
         allocazam<T, memory_mode::fixed> pool;
-        pool::run_allocator<false> runs;
+        runner::allocator<false> runs;
 
         explicit allocazam_std_state(size_t pool_size = 4096)
                 : pool(pool_size), runs(std::ranges::max(pool_size * sizeof(T), size_t{4096})) {}
@@ -287,7 +281,7 @@ namespace allocazam {
     template <typename T>
     struct alignas(detail::cache_line_size) allocazam_std_state<T, memory_mode::dynamic> {
         allocazam<T, memory_mode::dynamic> pool;
-        pool::run_allocator<true> runs;
+        runner::allocator<true> runs;
 
         explicit allocazam_std_state(size_t pool_size = 4096, size_t runner_bytes = 65536)
                 : pool(pool_size), runs(runner_bytes) {}
@@ -296,7 +290,7 @@ namespace allocazam {
     template <typename T>
     struct alignas(detail::cache_line_size) allocazam_std_state<T, memory_mode::noheap> {
         allocazam<T, memory_mode::noheap> pool;
-        pool::run_allocator<false> runs;
+        runner::allocator<false> runs;
 
         explicit allocazam_std_state(std::span<std::byte> node_backing, std::span<std::byte> run_backing)
                 : pool(node_backing), runs(run_backing) {}

@@ -16,6 +16,7 @@
 
 namespace allocazam {
     //
+    enum class memory_mode : uint8_t { fixed, dynamic, noheap };
 
     namespace detail {
 
@@ -36,6 +37,8 @@ namespace allocazam {
 #else
         inline constexpr size_t cache_line_size = 64;
 #endif
+
+        size_t detect_page_size() noexcept;
     }  // namespace detail
 
     template <typename T>

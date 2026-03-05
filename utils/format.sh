@@ -22,7 +22,7 @@ if [ $? -ne 0 ]; then
 fi
 
 cd "$(dirname $0)/../"
-readarray -t sources < <(find lib src bench tests | grep -E '\.([hc](pp)?)$' | grep -v '\#\|Catch2\|CLI11|glaze')
+readarray -t sources < <(find lib bench tests | grep -E '\.([hc](pp)?)$' | grep -v '\#\|Catch2\|CLI11|glaze')
 if [ "$1" = "verify" ] ; then
     if [ $($binary --output-replacements-xml "${sources[@]}"  | grep '</replacement>' | wc -l) -ne 0 ] ; then
         echo "Error"
