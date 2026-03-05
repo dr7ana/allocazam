@@ -87,7 +87,7 @@ namespace {
 
         size_t next_slot = 0;
 
-        for (size_t step : std::ranges::iota_view{size_t{0}, steps}) {
+        for (size_t step : std::views::iota(size_t{0}, steps)) {
             bool can_alloc = live_slots.size() < max_live;
             bool do_alloc = live_slots.empty() || (can_alloc && (coin(rng) < alloc_bias));
 
@@ -239,7 +239,7 @@ namespace {
             size_t pool_bytes,
             size_t warmup_runs,
             size_t repeats) {
-        for (size_t i : std::ranges::iota_view{size_t{0}, warmup_runs}) {
+        for (size_t i : std::views::iota(size_t{0}, warmup_runs)) {
             (void)i;
             PoolState state(pool_bytes);
             execute_trace(state.pool, trace);
@@ -261,7 +261,7 @@ namespace {
         coalesce_samples.reserve(repeats);
         peak_live_samples.reserve(repeats);
 
-        for (size_t rep : std::ranges::iota_view{size_t{0}, repeats}) {
+        for (size_t rep : std::views::iota(size_t{0}, repeats)) {
             (void)rep;
             PoolState state(pool_bytes);
             state.pool.reset_stats();

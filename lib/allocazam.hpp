@@ -3,6 +3,7 @@
 #include "runner.hpp"
 #include "types.hpp"
 
+#include <algorithm>
 #include <span>
 
 namespace allocazam {
@@ -192,9 +193,7 @@ namespace allocazam {
                 c = &_chunks.back();
             }
 
-            for (size_t i : std::ranges::iota_view{size_t{0}, c->count}) {
-                _push_free_node(c->at(i));
-            }
+            std::ranges::for_each(std::views::iota(size_t{0}, c->count), [&](size_t i) { _push_free_node(c->at(i)); });
 
             _capacity += c->count;
         }
@@ -206,9 +205,7 @@ namespace allocazam {
             _chunks[0] = chunk(nodes, slot_count);
             chunk* c = &_chunks[0];
 
-            for (size_t i : std::ranges::iota_view{size_t{0}, c->count}) {
-                _push_free_node(c->at(i));
-            }
+            std::ranges::for_each(std::views::iota(size_t{0}, c->count), [&](size_t i) { _push_free_node(c->at(i)); });
 
             _capacity += c->count;
         }
@@ -216,22 +213,19 @@ namespace allocazam {
         constexpr void _grow()
             requires(dynamic_mode<Mode>)
         {
-            _next_growth = std::ranges::max(static_cast<size_t>(1), _next_growth * 2);
+            size_t doubled_growth = 0;
+            if (!detail::checked_mul(_next_growth, size_t{2}, doubled_growth)) {
+                throw std::bad_alloc{};
+            }
+            _next_growth = std::ranges::max(static_cast<size_t>(1), doubled_growth);
             _add_chunk(_next_growth);
         }
 
         constexpr bool _owns_pointer(const T* ptr) const noexcept {
             auto* target_node = _node_from_bytes(reinterpret_cast<const std::byte*>(ptr));
-
-            for (const auto& c : _chunks) {
-                if (c.nodes == nullptr) {
-                    continue;
-                }
-                if (target_node >= c.nodes && target_node < (c.nodes + c.count)) {
-                    return true;
-                }
-            }
-            return false;
+            return std::ranges::any_of(_chunks, [target_node](const auto& c) {
+                return c.nodes != nullptr && target_node >= c.nodes && target_node < (c.nodes + c.count);
+            });
         }
 
         constexpr bool _is_in_free_list(const T* ptr) const noexcept {
@@ -372,7 +366,10 @@ namespace allocazam {
                 return static_cast<T*>(raw);
             }
 
-            size_t bytes = n * sizeof(T);
+            size_t bytes = 0;
+            if (!detail::checked_mul(n, sizeof(T), bytes)) {
+                throw std::bad_array_new_length{};
+            }
 
             if (_can_use_tls_run_cache(bytes)) [[likely]] {
                 T* p = _allocate_from_tls_run_cache(bytes);
@@ -425,7 +422,11 @@ namespace allocazam {
                 return;
             }
 
-            size_t bytes = n * sizeof(T);
+            size_t bytes = 0;
+            if (!detail::checked_mul(n, sizeof(T), bytes)) {
+                _runs().deallocate_bytes(static_cast<void*>(p));
+                return;
+            }
 
             if (_can_use_tls_run_cache(bytes)) [[likely]] {
                 _deallocate_to_tls_run_cache(p, bytes);
@@ -476,7 +477,7 @@ namespace allocazam {
         static constexpr size_t tls_run_quantum{alignof(std::max_align_t)};
         static constexpr size_t tls_run_cutoff{linear_cache_cutoff};
         static constexpr size_t tls_run_class_count{tls_run_cutoff / tls_run_quantum};
-        static constexpr size_t tls_refill_batch{1};
+        static constexpr size_t tls_refill_batch{4};
         static constexpr size_t tls_high_watermark{32};
         static constexpr size_t tls_drain_low_watermark{16};
         static_assert(std::has_single_bit(tls_run_quantum));
@@ -486,7 +487,7 @@ namespace allocazam {
             std::array<tls_run_class, tls_run_class_count> classes{};
 
             ~tls_run_cache() {
-                for (auto& cls : classes) {
+                std::ranges::for_each(classes, [](tls_run_class& cls) {
                     tls_run_node* node = cls.head;
                     while (node != nullptr) {
                         tls_run_node* next = node->next;
@@ -497,7 +498,7 @@ namespace allocazam {
                     }
                     cls.head = nullptr;
                     cls.count = 0;
-                }
+                });
             }
         };
 
@@ -596,9 +597,8 @@ namespace allocazam {
         }
 
         void _tls_drain_all() noexcept {
-            for (size_t idx : std::ranges::iota_view{size_t{0}, tls_run_class_count}) {
-                _tls_drain_class(idx, 0);
-            }
+            std::ranges::for_each(
+                    std::views::iota(size_t{0}, tls_run_class_count), [&](size_t idx) { _tls_drain_class(idx, 0); });
         }
 
         [[nodiscard]] T* _allocate_from_tls_run_cache(size_t bytes) {
@@ -620,8 +620,8 @@ namespace allocazam {
                 }
             }
 
-            if constexpr (tls_refill_batch > 1) {
-                for (size_t i : std::ranges::iota_view{size_t{1}, tls_refill_batch}) {
+            if constexpr (dynamic_mode<Mode>) {
+                for (size_t i : std::views::iota(size_t{1}, tls_refill_batch)) {
                     (void)i;
                     void* extra = _runs().allocate_bytes(class_bytes, alignof(T));
                     if (extra == nullptr) {

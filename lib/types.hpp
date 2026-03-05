@@ -6,6 +6,7 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <new>
 #include <ranges>
@@ -27,6 +28,38 @@ namespace allocazam {
             }
 
             return value + (multiple - rem);
+        }
+
+        inline constexpr bool checked_add(size_t lhs, size_t rhs, size_t& out) noexcept {
+            if (lhs > (std::numeric_limits<size_t>::max() - rhs)) {
+                return false;
+            }
+            out = lhs + rhs;
+            return true;
+        }
+
+        inline constexpr bool checked_mul(size_t lhs, size_t rhs, size_t& out) noexcept {
+            if (lhs == 0 || rhs == 0) {
+                out = 0;
+                return true;
+            }
+            if (lhs > (std::numeric_limits<size_t>::max() / rhs)) {
+                return false;
+            }
+            out = lhs * rhs;
+            return true;
+        }
+
+        inline constexpr bool checked_round_to_multiple_of(size_t value, size_t multiple, size_t& out) noexcept {
+            if (multiple == 0) {
+                return false;
+            }
+            size_t rem = value % multiple;
+            if (rem == 0) {
+                out = value;
+                return true;
+            }
+            return checked_add(value, multiple - rem, out);
         }
 
 #if defined(__cpp_lib_hardware_interference_size)
@@ -58,8 +91,17 @@ namespace allocazam {
         constexpr explicit chunk_t(size_t sz, size_t page_size, size_t alloc_alignment)
             requires(owns_memory)
                 : count{sz}, alloc_align{alloc_alignment} {
-            void* raw = ::operator new[](
-                    detail::round_to_multiple_of(count * sizeof(node), page_size), std::align_val_t{alloc_align});
+            size_t node_bytes = 0;
+            if (!detail::checked_mul(count, sizeof(node), node_bytes)) {
+                throw std::bad_array_new_length{};
+            }
+
+            size_t alloc_bytes = 0;
+            if (!detail::checked_round_to_multiple_of(node_bytes, page_size, alloc_bytes)) {
+                throw std::bad_array_new_length{};
+            }
+
+            void* raw = ::operator new[](alloc_bytes, std::align_val_t{alloc_align});
             nodes = static_cast<node*>(raw);
             std::uninitialized_default_construct_n(nodes, count);
         }

@@ -75,7 +75,7 @@ namespace allocazam_bench {
         stats.std_samples.reserve(repeats);
         stats.allocazam_samples.reserve(repeats);
 
-        for (size_t rep : std::ranges::iota_view{size_t{0}, repeats}) {
+        std::ranges::for_each(std::views::iota(size_t{0}, repeats), [&](size_t rep) {
             bool std_first = (rep & 1U) == 0U;
             if (std_first) {
                 stats.std_samples.push_back(std_fn());
@@ -84,7 +84,7 @@ namespace allocazam_bench {
                 stats.allocazam_samples.push_back(allocazam_fn());
                 stats.std_samples.push_back(std_fn());
             }
-        }
+        });
 
         stats.std_mean = mean_of(stats.std_samples);
         stats.allocazam_mean = mean_of(stats.allocazam_samples);
@@ -117,10 +117,10 @@ namespace allocazam_bench {
         std::vector<size_t> sizes;
         sizes.reserve(ratios.size() + 4);
 
-        for (const auto& ratio : ratios) {
+        std::ranges::for_each(ratios, [&](const auto& ratio) {
             size_t value = std::ranges::max(size_t{1}, (base * ratio.first) / ratio.second);
             sizes.push_back(value);
-        }
+        });
 
         sizes.push_back(base);
         std::ranges::sort(sizes);
@@ -136,12 +136,12 @@ namespace allocazam_bench {
                   << std::setw(12) << "iterations" << std::setw(13) << "ops" << std::setw(14) << "std median"
                   << std::setw(14) << "allocazam med" << std::setw(11) << "improv %" << "\n";
 
-        for (const auto& row : rows) {
+        std::ranges::for_each(rows, [](const granular_row& row) {
             std::cout << std::setw(12) << row.workload << std::setw(12) << row.unit_count << std::setw(12)
                       << row.bytes_per_iter << std::setw(12) << row.iterations << std::setw(13) << row.ops
                       << std::setw(14) << std::fixed << std::setprecision(6) << row.std_median << std::setw(14)
                       << row.allocazam_median << std::setw(11) << std::setprecision(2) << row.improvement << "\n";
-        }
+        });
     }
 
     [[nodiscard]] inline size_t parse_size_arg(int argc, char** argv, int index, size_t fallback) {

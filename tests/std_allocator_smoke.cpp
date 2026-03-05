@@ -1,8 +1,10 @@
 #include "allocazam.hpp"
 #include "utils.hpp"
 
+#include <algorithm>
 #include <deque>
 #include <iomanip>
+#include <limits>
 #include <list>
 #include <map>
 #include <thread>
@@ -15,9 +17,9 @@ namespace {
 
         constexpr blob_object() = default;
         constexpr explicit blob_object(size_t seed) {
-            for (size_t i : std::ranges::iota_view{size_t{0}, Words}) {
+            std::ranges::for_each(std::views::iota(size_t{0}, Words), [&](size_t i) {
                 words[i] = static_cast<uint64_t>((seed + 1) * (i + 3));
-            }
+            });
         }
 
         [[nodiscard]] constexpr size_t key() const noexcept { return static_cast<size_t>(words[0]); }
@@ -97,11 +99,11 @@ namespace {
     }
 
     std::string sanitize_cell(std::string text) {
-        for (char& c : text) {
+        std::ranges::for_each(text, [](char& c) {
             if (c == '\n' || c == '\r' || c == '|') {
                 c = ' ';
             }
-        }
+        });
         return text;
     }
 
@@ -178,9 +180,8 @@ namespace {
         std::vector<T, Alloc> values{alloc};
         values.reserve(count / 2 + 1);
 
-        for (size_t i : std::ranges::iota_view{size_t{0}, count}) {
-            values.push_back(make_value<T>(i));
-        }
+        std::ranges::for_each(
+                std::views::iota(size_t{0}, count), [&](size_t i) { values.push_back(make_value<T>(i)); });
 
         require(values.size() == count, "vector size mismatch");
         require(value_key(values.front()) == value_key(make_value<T>(0)), "vector front mismatch");
@@ -193,19 +194,15 @@ namespace {
     std::string exercise_deque(size_t count, const Alloc& alloc) {
         std::deque<T, Alloc> values{alloc};
 
-        for (size_t i : std::ranges::iota_view{size_t{0}, count}) {
-            values.push_back(make_value<T>(i));
-        }
+        std::ranges::for_each(
+                std::views::iota(size_t{0}, count), [&](size_t i) { values.push_back(make_value<T>(i)); });
 
         require(values.size() == count, "deque size mismatch");
         require(value_key(values.front()) == value_key(make_value<T>(0)), "deque front mismatch");
         require(value_key(values.back()) == value_key(make_value<T>(count - 1)), "deque back mismatch");
 
         size_t pop_count = count / 3;
-        for (size_t i : std::ranges::iota_view{size_t{0}, pop_count}) {
-            (void)i;
-            values.pop_front();
-        }
+        std::ranges::for_each(std::views::iota(size_t{0}, pop_count), [&](size_t) { values.pop_front(); });
         require(values.size() == (count - pop_count), "deque pop size mismatch");
 
         return "size=" + std::to_string(values.size());
@@ -215,9 +212,8 @@ namespace {
     std::string exercise_list(size_t count, const Alloc& alloc) {
         std::list<T, Alloc> values{alloc};
 
-        for (size_t i : std::ranges::iota_view{size_t{0}, count}) {
-            values.push_back(make_value<T>(i));
-        }
+        std::ranges::for_each(
+                std::views::iota(size_t{0}, count), [&](size_t i) { values.push_back(make_value<T>(i)); });
 
         require(values.size() == count, "list size mismatch");
         require(value_key(values.front()) == value_key(make_value<T>(0)), "list front mismatch");
@@ -230,18 +226,18 @@ namespace {
     std::string exercise_map(size_t count, const Alloc& alloc) {
         std::map<int, int, std::less<int>, Alloc> values{std::less<int>{}, alloc};
 
-        for (size_t i : std::ranges::iota_view{size_t{0}, count}) {
+        std::ranges::for_each(std::views::iota(size_t{0}, count), [&](size_t i) {
             auto [it, inserted] = values.emplace(static_cast<int>(i), static_cast<int>(i * 3 + 1));
             (void)it;
             require(inserted, "map emplace duplicate key");
-        }
+        });
 
         require(values.size() == count, "map size mismatch");
         require(values.begin()->first == 0, "map first key mismatch");
         require(values.rbegin()->first == static_cast<int>(count - 1), "map last key mismatch");
 
         size_t stride = std::ranges::max(size_t{1}, count / 16);
-        for (size_t i : std::ranges::iota_view{size_t{0}, count}) {
+        for (size_t i : std::views::iota(size_t{0}, count)) {
             if ((i % stride) != 0) {
                 continue;
             }
@@ -252,9 +248,8 @@ namespace {
         }
 
         size_t erase_count = count / 4;
-        for (size_t i : std::ranges::iota_view{size_t{0}, erase_count}) {
-            values.erase(static_cast<int>(i));
-        }
+        std::ranges::for_each(
+                std::views::iota(size_t{0}, erase_count), [&](size_t i) { values.erase(static_cast<int>(i)); });
         require(values.size() == (count - erase_count), "map erase size mismatch");
 
         return "size=" + std::to_string(values.size());
@@ -266,16 +261,16 @@ namespace {
                 0, std::hash<int>{}, std::equal_to<int>{}, alloc};
         values.reserve(count);
 
-        for (size_t i : std::ranges::iota_view{size_t{0}, count}) {
+        std::ranges::for_each(std::views::iota(size_t{0}, count), [&](size_t i) {
             auto [it, inserted] = values.emplace(static_cast<int>(i), static_cast<int>(i * 5 + 7));
             (void)it;
             require(inserted, "unordered_map emplace duplicate key");
-        }
+        });
 
         require(values.size() == count, "unordered_map size mismatch");
 
         size_t stride = std::ranges::max(size_t{1}, count / 16);
-        for (size_t i : std::ranges::iota_view{size_t{0}, count}) {
+        for (size_t i : std::views::iota(size_t{0}, count)) {
             if ((i % stride) != 0) {
                 continue;
             }
@@ -286,9 +281,8 @@ namespace {
         }
 
         size_t erase_count = count / 4;
-        for (size_t i : std::ranges::iota_view{size_t{0}, erase_count}) {
-            values.erase(static_cast<int>(i));
-        }
+        std::ranges::for_each(
+                std::views::iota(size_t{0}, erase_count), [&](size_t i) { values.erase(static_cast<int>(i)); });
         require(values.size() == (count - erase_count), "unordered_map erase size mismatch");
 
         return "size=" + std::to_string(values.size()) + " buckets=" + std::to_string(values.bucket_count());
@@ -299,9 +293,8 @@ namespace {
         std::basic_string<char, std::char_traits<char>, Alloc> s{alloc};
         s.reserve(length);
 
-        for (size_t i : std::ranges::iota_view{size_t{0}, length}) {
-            s.push_back(static_cast<char>('a' + (i % 26)));
-        }
+        std::ranges::for_each(
+                std::views::iota(size_t{0}, length), [&](size_t i) { s.push_back(static_cast<char>('a' + (i % 26))); });
 
         require(s.size() == length, "string size mismatch");
         require(s.front() == 'a', "string front mismatch");
@@ -316,17 +309,73 @@ namespace {
         T* p = a.allocate(n);
         require(p != nullptr, "allocate(n) returned null");
 
-        for (size_t i : std::ranges::iota_view{size_t{0}, n}) {
-            a.construct(p + i, make_value<T>(i));
-        }
+        std::ranges::for_each(std::views::iota(size_t{0}, n), [&](size_t i) { a.construct(p + i, make_value<T>(i)); });
 
-        for (size_t i : std::ranges::iota_view{size_t{0}, n}) {
+        std::ranges::for_each(std::views::iota(size_t{0}, n), [&](size_t i) {
             require(value_key(*(p + i)) == value_key(make_value<T>(i)), "allocate/construct round-trip mismatch");
             a.destroy(p + i);
-        }
+        });
 
         a.deallocate(p, n);
         return "n=" + std::to_string(n);
+    }
+
+    std::string exercise_std_allocator_overflow_count_guard() {
+        using alloc_t = allocazam::allocazam_std_allocator<int, allocazam::memory_mode::dynamic>;
+        alloc_t alloc{};
+
+        bool saw_bad_length = false;
+        try {
+            (void)alloc.allocate(alloc.max_size() + 1);
+        } catch (const std::bad_array_new_length&) {
+            saw_bad_length = true;
+        }
+
+        require(saw_bad_length, "std allocator overflow count guard should throw bad_array_new_length");
+        return "bad_array_new_length";
+    }
+
+    std::string exercise_chunk_overflow_guard() {
+        using node_t = allocazam::node_t<obj16>;
+        size_t overflow_count = (std::numeric_limits<size_t>::max() / sizeof(node_t)) + 1;
+
+        bool saw_bad_length = false;
+        try {
+            allocazam::chunk_t<obj16, true> chunk{overflow_count, 4096, alignof(node_t)};
+            (void)chunk;
+        } catch (const std::bad_array_new_length&) {
+            saw_bad_length = true;
+        }
+
+        require(saw_bad_length, "chunk overflow guard should throw bad_array_new_length");
+        return "bad_array_new_length";
+    }
+
+    std::string exercise_runner_overflow_guard() {
+        using runner_t = allocazam::runner::allocator<true>;
+        runner_t runs{65536};
+
+        void* immediate_fail = runs.allocate_bytes(std::numeric_limits<size_t>::max(), alignof(std::max_align_t));
+        require(immediate_fail == nullptr, "runner overflow add should fail with null");
+
+        bool saw_bad_alloc = false;
+        try {
+            (void)runs.allocate_bytes(std::numeric_limits<size_t>::max() - 64, alignof(std::max_align_t));
+        } catch (const std::bad_alloc&) {
+            saw_bad_alloc = true;
+        }
+        require(saw_bad_alloc, "runner overflow grow should throw bad_alloc");
+
+        bool saw_ctor_bad_alloc = false;
+        try {
+            runner_t huge{std::numeric_limits<size_t>::max()};
+            (void)huge;
+        } catch (const std::bad_alloc&) {
+            saw_ctor_bad_alloc = true;
+        }
+        require(saw_ctor_bad_alloc, "runner constructor overflow should throw bad_alloc");
+
+        return "safe-fail";
     }
 
     template <allocazam::memory_mode Mode>
@@ -428,18 +477,16 @@ namespace {
         using alloc_t = allocazam::allocazam_std_allocator<char, allocazam::memory_mode::fixed>;
         size_t succeeded = 0;
 
-        for (size_t i : std::ranges::iota_view{size_t{0}, thread_count}) {
-            (void)i;
+        std::ranges::for_each(std::views::iota(size_t{0}, thread_count), [&](size_t) {
             bool ok = false;
             std::thread worker{[&] {
                 try {
                     alloc_t alloc{};
-                    for (size_t j : std::ranges::iota_view{size_t{0}, request_count}) {
-                        (void)j;
+                    std::ranges::for_each(std::views::iota(size_t{0}, request_count), [&](size_t) {
                         char* p = alloc.allocate(64);
                         require(p != nullptr, "tls cache thread worker allocate returned null");
                         alloc.deallocate(p, 64);
-                    }
+                    });
                     ok = true;
                 } catch (...) {
                     ok = false;
@@ -448,7 +495,7 @@ namespace {
             worker.join();
             require(ok, "tls cache thread-exit reclaim failed under thread churn");
             ++succeeded;
-        }
+        });
 
         return "threads=" + std::to_string(succeeded);
     }
@@ -572,11 +619,11 @@ namespace {
                 return exercise_vector<obj256>(obj256_count, alloc);
             });
 
-            for (size_t len : lengths) {
+            std::ranges::for_each(lengths, [&](size_t len) {
                 add_mode_case<Mode, char>(rows, "string_push_back", len, char_budget, [&](const auto& alloc) {
                     return exercise_string(len, alloc);
                 });
-            }
+            });
 
             add_mode_case<Mode, int>(rows, "allocator_round_trip", 64, base_budget, [&](const auto& alloc) {
                 return exercise_round_trip<int>(64, alloc);
@@ -602,6 +649,18 @@ namespace {
                         });
                         return note;
                     });
+
+            if constexpr (Mode == allocazam::memory_mode::dynamic) {
+                add_case(rows, memory_mode_to_string(Mode), "overflow_std_count_guard", "int", 0, []() {
+                    return exercise_std_allocator_overflow_count_guard();
+                });
+                add_case(rows, memory_mode_to_string(Mode), "overflow_chunk_guard", "obj16", 0, []() {
+                    return exercise_chunk_overflow_guard();
+                });
+                add_case(rows, memory_mode_to_string(Mode), "overflow_runner_guard", "n/a", 0, []() {
+                    return exercise_runner_overflow_guard();
+                });
+            }
 
             if constexpr (Mode == allocazam::memory_mode::fixed) {
                 add_case(rows, memory_mode_to_string(Mode), "map_rebind_explicit_state", "pair<int,int>", 1024, [&]() {
@@ -630,18 +689,14 @@ namespace {
                   << "--------------" << std::setw(10) << "--------" << std::setw(8) << "------"
                   << "----------------------------------------\n";
 
-        for (const auto& row : rows) {
+        std::ranges::for_each(rows, [](const smoke_row& row) {
             std::cout << std::setw(10) << row.mode << std::setw(28) << row.test_name << std::setw(16) << row.type_name
                       << std::setw(10) << row.workload << std::setw(8) << (row.pass ? "PASS" : "FAIL") << row.note
                       << "\n";
-        }
+        });
 
-        size_t pass_count = 0;
-        for (const auto& row : rows) {
-            if (row.pass) {
-                ++pass_count;
-            }
-        }
+        size_t pass_count =
+                static_cast<size_t>(std::ranges::count_if(rows, [](const smoke_row& row) { return row.pass; }));
 
         std::cout << "\nsummary: " << pass_count << "/" << rows.size() << " cases passed\n";
     }
@@ -657,10 +712,8 @@ int main() {
 
     print_table(rows);
 
-    for (const auto& row : rows) {
-        if (!row.pass) {
-            return 1;
-        }
+    if (std::ranges::any_of(rows, [](const smoke_row& row) { return !row.pass; })) {
+        return 1;
     }
 
     return 0;

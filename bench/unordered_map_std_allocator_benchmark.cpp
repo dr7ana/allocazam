@@ -33,14 +33,14 @@ namespace {
             }
 
             auto start = allocazam_bench::clock_t::now();
-            for (size_t b : std::ranges::iota_view{size_t{0}, batch_count}) {
+            for (size_t b : std::views::iota(size_t{0}, batch_count)) {
                 auto& values = batch[b];
 
-                for (size_t i : std::ranges::iota_view{size_t{0}, count_per_iter}) {
+                for (size_t i : std::views::iota(size_t{0}, count_per_iter)) {
                     values.emplace(static_cast<int>(i), static_cast<int>(base + b + i));
                 }
 
-                for (size_t i : std::ranges::iota_view{size_t{0}, count_per_iter}) {
+                for (size_t i : std::views::iota(size_t{0}, count_per_iter)) {
                     if ((i & 3U) != 0U) {
                         continue;
                     }
@@ -51,7 +51,7 @@ namespace {
                 }
 
                 size_t erase_count = unordered_map_erase_count(count_per_iter);
-                for (size_t i : std::ranges::iota_view{size_t{0}, erase_count}) {
+                for (size_t i : std::views::iota(size_t{0}, erase_count)) {
                     values.erase(static_cast<int>(i));
                 }
             }
@@ -86,14 +86,14 @@ namespace {
             }
 
             auto start = allocazam_bench::clock_t::now();
-            for (size_t b : std::ranges::iota_view{size_t{0}, batch_count}) {
+            for (size_t b : std::views::iota(size_t{0}, batch_count)) {
                 auto& values = batch[b];
 
-                for (size_t i : std::ranges::iota_view{size_t{0}, count_per_iter}) {
+                for (size_t i : std::views::iota(size_t{0}, count_per_iter)) {
                     values.emplace(static_cast<int>(i), static_cast<int>(base + b + i));
                 }
 
-                for (size_t i : std::ranges::iota_view{size_t{0}, count_per_iter}) {
+                for (size_t i : std::views::iota(size_t{0}, count_per_iter)) {
                     if ((i & 3U) != 0U) {
                         continue;
                     }
@@ -104,7 +104,7 @@ namespace {
                 }
 
                 size_t erase_count = unordered_map_erase_count(count_per_iter);
-                for (size_t i : std::ranges::iota_view{size_t{0}, erase_count}) {
+                for (size_t i : std::views::iota(size_t{0}, erase_count)) {
                     values.erase(static_cast<int>(i));
                 }
             }

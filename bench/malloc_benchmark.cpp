@@ -33,7 +33,7 @@ namespace {
     template <typename alloc_t>
     benchmark_result benchmark_scalar_allocazam(std::string_view name, alloc_t& alloc, size_t iterations) {
         auto start = clock_t::now();
-        for (size_t i : std::ranges::iota_view{size_t{0}, iterations}) {
+        for (size_t i : std::views::iota(size_t{0}, iterations)) {
             auto* p = alloc.allocate();
             if (p == nullptr) {
                 throw std::bad_alloc{};
@@ -53,8 +53,8 @@ namespace {
         std::vector<test_object*> ptrs(burst_size, nullptr);
 
         auto start = clock_t::now();
-        for (size_t i : std::ranges::iota_view{size_t{0}, iterations}) {
-            for (size_t j : std::ranges::iota_view{size_t{0}, burst_size}) {
+        for (size_t i : std::views::iota(size_t{0}, iterations)) {
+            for (size_t j : std::views::iota(size_t{0}, burst_size)) {
                 auto idx = i * burst_size + j;
                 auto* p = alloc.allocate();
                 if (p == nullptr) {
@@ -64,7 +64,7 @@ namespace {
                 ptrs[j] = p;
             }
 
-            for (size_t j : std::ranges::iota_view{size_t{0}, burst_size}) {
+            for (size_t j : std::views::iota(size_t{0}, burst_size)) {
                 sink += static_cast<uint64_t>(ptrs[j]->y);
                 alloc.destroy(ptrs[j]);
                 alloc.deallocate(ptrs[j]);
@@ -76,7 +76,7 @@ namespace {
 
     benchmark_result benchmark_scalar_malloc(size_t iterations) {
         auto start = clock_t::now();
-        for (size_t i : std::ranges::iota_view{size_t{0}, iterations}) {
+        for (size_t i : std::views::iota(size_t{0}, iterations)) {
             void* raw = std::malloc(sizeof(test_object));
             if (raw == nullptr) {
                 throw std::bad_alloc{};
@@ -94,8 +94,8 @@ namespace {
         std::vector<test_object*> ptrs(burst_size, nullptr);
 
         auto start = clock_t::now();
-        for (size_t i : std::ranges::iota_view{size_t{0}, iterations}) {
-            for (size_t j : std::ranges::iota_view{size_t{0}, burst_size}) {
+        for (size_t i : std::views::iota(size_t{0}, iterations)) {
+            for (size_t j : std::views::iota(size_t{0}, burst_size)) {
                 auto idx = i * burst_size + j;
                 void* raw = std::malloc(sizeof(test_object));
                 if (raw == nullptr) {
@@ -105,7 +105,7 @@ namespace {
                         test_object(static_cast<int>(idx), static_cast<int>(idx + 1), static_cast<int>(idx + 2));
             }
 
-            for (size_t j : std::ranges::iota_view{size_t{0}, burst_size}) {
+            for (size_t j : std::views::iota(size_t{0}, burst_size)) {
                 sink += static_cast<uint64_t>(ptrs[j]->y);
                 ptrs[j]->~test_object();
                 std::free(ptrs[j]);

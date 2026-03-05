@@ -94,8 +94,27 @@ namespace allocazam { namespace runner {
                 _stats.requested_bytes += bytes;
             }
 
-            size_t payload = _align_up_pow2(bytes, run_alignment);
-            size_t needed = _align_up_pow2(sizeof(run_header) + payload, run_alignment);
+            auto fail_allocate = [&]() -> void* {
+                if constexpr (collect_stats) {
+                    ++_stats.allocate_fail;
+                }
+                return nullptr;
+            };
+
+            size_t payload = 0;
+            if (!detail::checked_add(bytes, run_alignment - 1, payload)) {
+                return fail_allocate();
+            }
+            payload &= ~(run_alignment - 1);
+
+            size_t needed = 0;
+            if (!detail::checked_add(sizeof(run_header), payload, needed)) {
+                return fail_allocate();
+            }
+            if (!detail::checked_add(needed, run_alignment - 1, needed)) {
+                return fail_allocate();
+            }
+            needed &= ~(run_alignment - 1);
             needed = std::ranges::max(needed, min_free_run_size);
             size_t scan_count = 0;
             run_header* h = _find_fit(needed, scan_count);
@@ -105,10 +124,7 @@ namespace allocazam { namespace runner {
                     h = _find_fit(needed, scan_count);
                 }
                 if (h == nullptr) {
-                    if constexpr (collect_stats) {
-                        ++_stats.allocate_fail;
-                    }
-                    return nullptr;
+                    return fail_allocate();
                 }
             }
             void* out = _allocate_from_free_run(h, needed);
@@ -416,9 +432,20 @@ namespace allocazam { namespace runner {
             if constexpr (collect_stats) {
                 ++_stats.grow_calls;
             }
-            size_t chunk_bytes = std::ranges::max(_next_growth, needed + min_chunk_bytes);
+
+            size_t needed_with_overhead = 0;
+            if (!detail::checked_add(needed, min_chunk_bytes, needed_with_overhead)) {
+                throw std::bad_alloc{};
+            }
+
+            size_t chunk_bytes = std::ranges::max(_next_growth, needed_with_overhead);
             _add_owned_chunk(chunk_bytes);
-            _next_growth = std::ranges::max(_next_growth * 2, chunk_bytes);
+
+            size_t doubled_growth = 0;
+            if (!detail::checked_mul(_next_growth, size_t{2}, doubled_growth)) {
+                doubled_growth = std::numeric_limits<size_t>::max();
+            }
+            _next_growth = std::ranges::max(doubled_growth, chunk_bytes);
         }
 
         void _initialize_free_run(chunk_node* c) {
@@ -433,9 +460,22 @@ namespace allocazam { namespace runner {
         }
 
         void _add_owned_chunk(size_t bytes) {
-            size_t chunk_bytes = detail::round_to_multiple_of(std::ranges::max(bytes, min_chunk_bytes), _page_size);
+            size_t rounded_input = std::ranges::max(bytes, min_chunk_bytes);
+            size_t chunk_bytes = 0;
+            if (!detail::checked_round_to_multiple_of(rounded_input, _page_size, chunk_bytes)) {
+                throw std::bad_alloc{};
+            }
 
-            size_t total_bytes = sizeof(chunk_node) + run_alignment - 1 + chunk_bytes;
+            size_t overhead_bytes = 0;
+            if (!detail::checked_add(sizeof(chunk_node), run_alignment - 1, overhead_bytes)) {
+                throw std::bad_alloc{};
+            }
+
+            size_t total_bytes = 0;
+            if (!detail::checked_add(overhead_bytes, chunk_bytes, total_bytes)) {
+                throw std::bad_alloc{};
+            }
+
             auto* raw = static_cast<std::byte*>(::operator new[](total_bytes, std::align_val_t{run_alignment}));
             auto* c = reinterpret_cast<chunk_node*>(raw);
             std::byte* begin = _align_up_ptr(raw + sizeof(chunk_node), run_alignment);

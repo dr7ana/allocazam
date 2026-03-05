@@ -16,9 +16,9 @@ namespace {
             batch.resize(batch_count);
 
             auto start = allocazam_bench::clock_t::now();
-            for (size_t b : std::ranges::iota_view{size_t{0}, batch_count}) {
+            for (size_t b : std::views::iota(size_t{0}, batch_count)) {
                 auto& s = batch[b];
-                for (size_t i : std::ranges::iota_view{size_t{0}, chars_per_iter}) {
+                for (size_t i : std::views::iota(size_t{0}, chars_per_iter)) {
                     s.push_back(static_cast<char>('a' + ((base + b + i) % 26)));
                 }
             }
@@ -48,9 +48,9 @@ namespace {
             batch.resize(batch_count);
 
             auto start = allocazam_bench::clock_t::now();
-            for (size_t b : std::ranges::iota_view{size_t{0}, batch_count}) {
+            for (size_t b : std::views::iota(size_t{0}, batch_count)) {
                 auto& s = batch[b];
-                for (size_t i : std::ranges::iota_view{size_t{0}, chars_per_iter}) {
+                for (size_t i : std::views::iota(size_t{0}, chars_per_iter)) {
                     s.push_back(static_cast<char>('a' + ((base + b + i) % 26)));
                 }
             }

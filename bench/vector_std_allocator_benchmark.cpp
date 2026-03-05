@@ -16,16 +16,16 @@ namespace {
 
             std::vector<std::vector<int>> batch;
             batch.reserve(batch_count);
-            for (size_t b : std::ranges::iota_view{size_t{0}, batch_count}) {
+            for (size_t b : std::views::iota(size_t{0}, batch_count)) {
                 (void)b;
                 batch.emplace_back();
                 batch.back().reserve(count_per_iter);
             }
 
             auto start = allocazam_bench::clock_t::now();
-            for (size_t b : std::ranges::iota_view{size_t{0}, batch_count}) {
+            for (size_t b : std::views::iota(size_t{0}, batch_count)) {
                 auto& values = batch[b];
-                for (size_t i : std::ranges::iota_view{size_t{0}, count_per_iter}) {
+                for (size_t i : std::views::iota(size_t{0}, count_per_iter)) {
                     values.emplace_back(static_cast<int>(base + b + i));
                 }
             }
@@ -55,16 +55,16 @@ namespace {
 
             std::vector<container_t> batch;
             batch.reserve(batch_count);
-            for (size_t b : std::ranges::iota_view{size_t{0}, batch_count}) {
+            for (size_t b : std::views::iota(size_t{0}, batch_count)) {
                 (void)b;
                 batch.emplace_back();
                 batch.back().reserve(count_per_iter);
             }
 
             auto start = allocazam_bench::clock_t::now();
-            for (size_t b : std::ranges::iota_view{size_t{0}, batch_count}) {
+            for (size_t b : std::views::iota(size_t{0}, batch_count)) {
                 auto& values = batch[b];
-                for (size_t i : std::ranges::iota_view{size_t{0}, count_per_iter}) {
+                for (size_t i : std::views::iota(size_t{0}, count_per_iter)) {
                     values.emplace_back(static_cast<int>(base + b + i));
                 }
             }
@@ -91,15 +91,15 @@ namespace {
 
             std::vector<std::vector<int>> batch;
             batch.reserve(batch_count);
-            for (size_t b : std::ranges::iota_view{size_t{0}, batch_count}) {
+            for (size_t b : std::views::iota(size_t{0}, batch_count)) {
                 (void)b;
                 batch.emplace_back();
             }
 
             auto start = allocazam_bench::clock_t::now();
-            for (size_t b : std::ranges::iota_view{size_t{0}, batch_count}) {
+            for (size_t b : std::views::iota(size_t{0}, batch_count)) {
                 auto& values = batch[b];
-                for (size_t i : std::ranges::iota_view{size_t{0}, count_per_iter}) {
+                for (size_t i : std::views::iota(size_t{0}, count_per_iter)) {
                     values.emplace_back(static_cast<int>(base + b + i));
                 }
             }
@@ -129,15 +129,15 @@ namespace {
 
             std::vector<container_t> batch;
             batch.reserve(batch_count);
-            for (size_t b : std::ranges::iota_view{size_t{0}, batch_count}) {
+            for (size_t b : std::views::iota(size_t{0}, batch_count)) {
                 (void)b;
                 batch.emplace_back();
             }
 
             auto start = allocazam_bench::clock_t::now();
-            for (size_t b : std::ranges::iota_view{size_t{0}, batch_count}) {
+            for (size_t b : std::views::iota(size_t{0}, batch_count)) {
                 auto& values = batch[b];
-                for (size_t i : std::ranges::iota_view{size_t{0}, count_per_iter}) {
+                for (size_t i : std::views::iota(size_t{0}, count_per_iter)) {
                     values.emplace_back(static_cast<int>(base + b + i));
                 }
             }

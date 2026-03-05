@@ -20,3 +20,7 @@ target_include_directories(allocazam_unordered_map_std_allocator_benchmark PRIVA
 
 add_executable(allocazam_runner_benchmark runner_benchmark.cpp)
 target_link_libraries(allocazam_runner_benchmark PUBLIC liballocazam)
+
+add_executable(allocazam_std_concurrent_benchmark std_concurrent_benchmark.cpp)
+target_link_libraries(allocazam_std_concurrent_benchmark PUBLIC liballocazam)
+target_include_directories(allocazam_std_concurrent_benchmark PRIVATE ${PROJECT_SOURCE_DIR}/bench)
