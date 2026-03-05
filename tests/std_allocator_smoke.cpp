@@ -328,6 +328,101 @@ namespace {
         return "n=" + std::to_string(n);
     }
 
+    template <allocazam::memory_mode Mode>
+    std::string exercise_map_rebind_explicit_state(
+            size_t state_budget, size_t max_inserts, size_t max_allowed_inserts) {
+        using pair_t = std::pair<const int, int>;
+        using state_t = allocazam::allocazam_std_state<pair_t, Mode>;
+        using alloc_t = allocazam::allocazam_std_allocator<pair_t, Mode>;
+        using map_t = std::map<int, int, std::less<int>, alloc_t>;
+
+        size_t inserted = 0;
+        bool saw_bad_alloc = false;
+
+        auto run = [&](const alloc_t& alloc) {
+            map_t values{std::less<int>{}, alloc};
+            try {
+                for (; inserted < max_inserts; ++inserted) {
+                    values.emplace(static_cast<int>(inserted), static_cast<int>(inserted * 7 + 3));
+                }
+            } catch (const std::bad_alloc&) {
+                saw_bad_alloc = true;
+            }
+
+            require(values.size() == inserted, "map explicit-state size mismatch");
+            if (inserted != 0) {
+                require(values.begin()->first == 0, "map explicit-state first key mismatch");
+                require(values.find(static_cast<int>(inserted - 1)) != values.end(),
+                        "map explicit-state last key missing");
+            }
+        };
+
+        if constexpr (Mode == allocazam::memory_mode::fixed) {
+            state_t state{state_budget};
+            alloc_t alloc{state};
+            run(alloc);
+        } else if constexpr (Mode == allocazam::memory_mode::noheap) {
+            std::vector<std::byte> backing(state_budget);
+            state_t state{std::span<std::byte>{backing.data(), backing.size()}};
+            alloc_t alloc{state};
+            run(alloc);
+        } else {
+            static_assert(Mode != allocazam::memory_mode::dynamic, "explicit-state rebind test supports fixed/noheap");
+        }
+
+        require(saw_bad_alloc, "map explicit-state rebind should hit bad_alloc under tiny bounded state");
+        require(inserted <= max_allowed_inserts, "map explicit-state rebind inserted unexpectedly high element count");
+        return "inserted=" + std::to_string(inserted);
+    }
+
+    template <allocazam::memory_mode Mode>
+    std::string exercise_unordered_map_rebind_explicit_state(
+            size_t state_budget, size_t max_inserts, size_t max_allowed_inserts) {
+        using pair_t = std::pair<const int, int>;
+        using state_t = allocazam::allocazam_std_state<pair_t, Mode>;
+        using alloc_t = allocazam::allocazam_std_allocator<pair_t, Mode>;
+        using unordered_map_t = std::unordered_map<int, int, std::hash<int>, std::equal_to<int>, alloc_t>;
+
+        size_t inserted = 0;
+        bool saw_bad_alloc = false;
+
+        auto run = [&](const alloc_t& alloc) {
+            unordered_map_t values{0, std::hash<int>{}, std::equal_to<int>{}, alloc};
+            try {
+                for (; inserted < max_inserts; ++inserted) {
+                    values.emplace(static_cast<int>(inserted), static_cast<int>(inserted * 11 + 1));
+                }
+            } catch (const std::bad_alloc&) {
+                saw_bad_alloc = true;
+            }
+
+            require(values.size() == inserted, "unordered_map explicit-state size mismatch");
+            if (inserted != 0) {
+                require(values.find(0) != values.end(), "unordered_map explicit-state key 0 missing");
+                require(values.find(static_cast<int>(inserted - 1)) != values.end(),
+                        "unordered_map explicit-state last key missing");
+            }
+        };
+
+        if constexpr (Mode == allocazam::memory_mode::fixed) {
+            state_t state{state_budget};
+            alloc_t alloc{state};
+            run(alloc);
+        } else if constexpr (Mode == allocazam::memory_mode::noheap) {
+            std::vector<std::byte> backing(state_budget);
+            state_t state{std::span<std::byte>{backing.data(), backing.size()}};
+            alloc_t alloc{state};
+            run(alloc);
+        } else {
+            static_assert(Mode != allocazam::memory_mode::dynamic, "explicit-state rebind test supports fixed/noheap");
+        }
+
+        require(saw_bad_alloc, "unordered_map explicit-state rebind should hit bad_alloc under tiny bounded state");
+        require(inserted <= max_allowed_inserts,
+                "unordered_map explicit-state rebind inserted unexpectedly high element count");
+        return "inserted=" + std::to_string(inserted);
+    }
+
     template <allocazam::memory_mode Mode, typename T, typename Fn>
     void add_mode_case(
             std::vector<smoke_row>& rows, std::string_view test_name, size_t workload, size_t budget, Fn&& fn) {
@@ -407,8 +502,18 @@ namespace {
             add_mode_case<Mode, char>(rows, "allocator_round_trip", 512, char_budget, [&](const auto& alloc) {
                 return exercise_round_trip<char>(512, alloc);
             });
+            add_case(rows, memory_mode_to_string(Mode), "map_rebind_explicit_state", "pair<int,int>", 1024, [&]() {
+                return exercise_map_rebind_explicit_state<Mode>(4096, 1024, 128);
+            });
+            add_case(
+                    rows,
+                    memory_mode_to_string(Mode),
+                    "unordered_map_rebind_explicit_state",
+                    "pair<int,int>",
+                    1024,
+                    [&]() { return exercise_unordered_map_rebind_explicit_state<Mode>(4096, 1024, 128); });
             add_case(rows, memory_mode_to_string(Mode), "container_matrix", "n/a", 0, []() -> std::string {
-                return "skipped (noheap rebind for list/deque/map/unordered_map not implemented)";
+                return "skipped (noheap rebind for list/deque broad matrix not implemented)";
             });
         } else {
             add_mode_case<Mode, int>(rows, "vector_push_back", int_count, base_budget, [&](const auto& alloc) {
@@ -467,6 +572,19 @@ namespace {
                         });
                         return note;
                     });
+
+            if constexpr (Mode == allocazam::memory_mode::fixed) {
+                add_case(rows, memory_mode_to_string(Mode), "map_rebind_explicit_state", "pair<int,int>", 1024, [&]() {
+                    return exercise_map_rebind_explicit_state<Mode>(1, 1024, 256);
+                });
+                add_case(
+                        rows,
+                        memory_mode_to_string(Mode),
+                        "unordered_map_rebind_explicit_state",
+                        "pair<int,int>",
+                        1024,
+                        [&]() { return exercise_unordered_map_rebind_explicit_state<Mode>(1, 1024, 256); });
+            }
         }
     }
 
