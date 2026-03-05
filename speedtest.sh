@@ -27,6 +27,31 @@ cmake \
     -DCMAKE_C_FLAGS_RELEASE="${C_FLAGS_RELEASE}" \
     -DCMAKE_CXX_FLAGS_RELEASE="${CXX_FLAGS_RELEASE}"
 
-cmake --build "${BUILD_DIR}" -j "${JOBS}" --target allocazam_malloc_benchmark
+target_name="falloc_benchmark"
+if [[ -f "${ROOT_DIR}/bench/CMakeLists.txt" ]]; then
+    target_name="allocazam_malloc_benchmark"
+fi
 
-"${BUILD_DIR}/allocazam_malloc_benchmark" "$@"
+cmake --build "${BUILD_DIR}" -j "${JOBS}" --target "${target_name}"
+
+binary_candidates=(
+    "${BUILD_DIR}/bench/allocazam_malloc_benchmark"
+    "${BUILD_DIR}/allocazam_malloc_benchmark"
+    "${BUILD_DIR}/bench/falloc_benchmark"
+    "${BUILD_DIR}/falloc_benchmark"
+)
+
+benchmark_bin=""
+for candidate in "${binary_candidates[@]}"; do
+    if [[ -x "${candidate}" ]]; then
+        benchmark_bin="${candidate}"
+        break
+    fi
+done
+
+if [[ -z "${benchmark_bin}" ]]; then
+    echo "Could not find malloc benchmark binary in expected locations."
+    exit 1
+fi
+
+"${benchmark_bin}" "$@"
