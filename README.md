@@ -1,6 +1,6 @@
 # allocazam
 
-`allocazam` is a C++23 custom allocator project focused on predictable pool behavior and low-overhead allocation paths for allocator-aware containers.
+`allocazam` is a C++23 hybrid freelist allocator with size-segregated bins, optimized for predictable, deterministic low-latency allocation.
 
 This repository is under active development (read: "I'm tinkering"); internals and APIs may continue to change (read: "break").
 
