@@ -306,6 +306,7 @@ namespace allocazam {
       public:
         using value_type = T;
         using state_type = allocazam_std_state<T, Mode>;
+        using runs_type = std::conditional_t<dynamic_mode<Mode>, runner::allocator<true>, runner::allocator<false>>;
         static constexpr size_t linear_cache_cutoff = 4096;
 
         using propagate_on_container_copy_assignment = std::true_type;
@@ -329,21 +330,23 @@ namespace allocazam {
 
         constexpr allocazam_std_allocator()
             requires(heap_backed_mode<Mode>)
-                : _state{&_default_state()}, _tls_enabled{true} {}
+                : _state{&_default_state()}, _runs_override{nullptr}, _tls_enabled{true} {}
 
-        constexpr explicit allocazam_std_allocator(state_type& state) noexcept : _state{&state}, _tls_enabled{false} {}
+        constexpr explicit allocazam_std_allocator(state_type& state) noexcept
+                : _state{&state}, _runs_override{nullptr}, _tls_enabled{false} {}
 
         template <typename U>
-        constexpr allocazam_std_allocator(const allocazam_std_allocator<U, Mode>&)
-            requires(heap_backed_mode<Mode>)
-                : _state{&_default_state()}, _tls_enabled{true} {}
+        constexpr allocazam_std_allocator(const allocazam_std_allocator<U, Mode>& other) noexcept
+                : _state{nullptr}, _runs_override{other._runs_ptr()}, _tls_enabled{false} {
+            assert(_runs_override != nullptr && "rebind source allocator must be initialized");
+        }
 
         template <typename U>
         constexpr allocazam_std_allocator(const allocazam_std_allocator<U, Mode>&, state_type& state) noexcept
-                : _state{&state}, _tls_enabled{false} {}
+                : _state{&state}, _runs_override{nullptr}, _tls_enabled{false} {}
 
         [[nodiscard]] T* allocate(size_t n) {
-            assert(_state != nullptr && "allocator state must be initialized");
+            assert(_has_allocation_resource() && "allocator state must be initialized");
 
             if (n == 0) {
                 return nullptr;
@@ -354,11 +357,19 @@ namespace allocazam {
             }
 
             if (n == 1) [[likely]] {
-                T* p = _state->pool.allocate();
-                if (p == nullptr) {
+                if (_state != nullptr) {
+                    T* p = _state->pool.allocate();
+                    if (p == nullptr) {
+                        throw std::bad_alloc{};
+                    }
+                    return p;
+                }
+
+                void* raw = _runs().allocate_bytes(sizeof(T), alignof(T));
+                if (raw == nullptr) {
                     throw std::bad_alloc{};
                 }
-                return p;
+                return static_cast<T*>(raw);
             }
 
             size_t bytes = n * sizeof(T);
@@ -370,7 +381,7 @@ namespace allocazam {
                 }
             }
 
-            void* raw = _state->runs.allocate_bytes(bytes, alignof(T));
+            void* raw = _runs().allocate_bytes(bytes, alignof(T));
             if (raw == nullptr) {
                 throw std::bad_alloc{};
             }
@@ -403,10 +414,14 @@ namespace allocazam {
                 return;
             }
 
-            assert(_state != nullptr && "allocator state must be initialized");
+            assert(_has_allocation_resource() && "allocator state must be initialized");
 
             if (n == 1) [[likely]] {
-                _state->pool.deallocate(p);
+                if (_state != nullptr) {
+                    _state->pool.deallocate(p);
+                } else {
+                    _runs().deallocate_bytes(static_cast<void*>(p));
+                }
                 return;
             }
 
@@ -417,7 +432,7 @@ namespace allocazam {
                 return;
             }
 
-            _state->runs.deallocate_bytes(static_cast<void*>(p));
+            _runs().deallocate_bytes(static_cast<void*>(p));
         }
 
         template <typename U, typename... args_t>
@@ -436,7 +451,7 @@ namespace allocazam {
 
         friend constexpr bool operator==(
                 const allocazam_std_allocator& lhs, const allocazam_std_allocator& rhs) noexcept {
-            return lhs._state == rhs._state;
+            return lhs._state == rhs._state && lhs._runs_override == rhs._runs_override;
         }
 
         friend constexpr bool operator!=(
@@ -445,6 +460,9 @@ namespace allocazam {
         }
 
       private:
+        template <typename U, memory_mode OtherMode>
+        friend class allocazam_std_allocator;
+
         struct tls_run_node {
             tls_run_node* next;
         };
@@ -493,6 +511,23 @@ namespace allocazam {
             }
         }
 
+        [[nodiscard]] constexpr bool _has_allocation_resource() const noexcept {
+            return _state != nullptr || _runs_override != nullptr;
+        }
+
+        [[nodiscard]] runs_type* _runs_ptr() const noexcept {
+            if (_state != nullptr) {
+                return const_cast<runs_type*>(std::addressof(_state->runs));
+            }
+            return _runs_override;
+        }
+
+        [[nodiscard]] runs_type& _runs() const noexcept {
+            runs_type* runs = _runs_ptr();
+            assert(runs != nullptr && "allocator runs must be initialized");
+            return *runs;
+        }
+
         static void _tls_push(size_t idx, void* p) noexcept {
             auto& cls = _tls_run_cache.classes[idx];
             auto* node = std::construct_at(static_cast<tls_run_node*>(p), cls.head);
@@ -518,7 +553,7 @@ namespace allocazam {
                 if (node == nullptr) {
                     break;
                 }
-                _state->runs.deallocate_bytes(static_cast<void*>(node));
+                _runs().deallocate_bytes(static_cast<void*>(node));
             }
         }
 
@@ -535,10 +570,10 @@ namespace allocazam {
             }
 
             size_t class_bytes = _tls_class_bytes(idx);
-            void* raw = _state->runs.allocate_bytes(class_bytes, alignof(T));
+            void* raw = _runs().allocate_bytes(class_bytes, alignof(T));
             if (raw == nullptr) {
                 _tls_drain_all();
-                raw = _state->runs.allocate_bytes(class_bytes, alignof(T));
+                raw = _runs().allocate_bytes(class_bytes, alignof(T));
                 if (raw == nullptr) {
                     return nullptr;
                 }
@@ -547,7 +582,7 @@ namespace allocazam {
             if constexpr (tls_refill_batch > 1) {
                 for (size_t i : std::ranges::iota_view{size_t{1}, tls_refill_batch}) {
                     (void)i;
-                    void* extra = _state->runs.allocate_bytes(class_bytes, alignof(T));
+                    void* extra = _runs().allocate_bytes(class_bytes, alignof(T));
                     if (extra == nullptr) {
                         break;
                     }
@@ -574,6 +609,7 @@ namespace allocazam {
         }
 
         state_type* _state{nullptr};
+        runs_type* _runs_override{nullptr};
         bool _tls_enabled{false};
     };
 
