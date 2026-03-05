@@ -5,6 +5,7 @@
 #include <iomanip>
 #include <list>
 #include <map>
+#include <thread>
 #include <unordered_map>
 
 namespace {
@@ -423,6 +424,35 @@ namespace {
         return "inserted=" + std::to_string(inserted);
     }
 
+    std::string exercise_tls_cache_thread_exit_reclaim(size_t thread_count, size_t request_count) {
+        using alloc_t = allocazam::allocazam_std_allocator<char, allocazam::memory_mode::fixed>;
+        size_t succeeded = 0;
+
+        for (size_t i : std::ranges::iota_view{size_t{0}, thread_count}) {
+            (void)i;
+            bool ok = false;
+            std::thread worker{[&] {
+                try {
+                    alloc_t alloc{};
+                    for (size_t j : std::ranges::iota_view{size_t{0}, request_count}) {
+                        (void)j;
+                        char* p = alloc.allocate(64);
+                        require(p != nullptr, "tls cache thread worker allocate returned null");
+                        alloc.deallocate(p, 64);
+                    }
+                    ok = true;
+                } catch (...) {
+                    ok = false;
+                }
+            }};
+            worker.join();
+            require(ok, "tls cache thread-exit reclaim failed under thread churn");
+            ++succeeded;
+        }
+
+        return "threads=" + std::to_string(succeeded);
+    }
+
     template <allocazam::memory_mode Mode, typename T, typename Fn>
     void add_mode_case(
             std::vector<smoke_row>& rows, std::string_view test_name, size_t workload, size_t budget, Fn&& fn) {
@@ -584,6 +614,9 @@ namespace {
                         "pair<int,int>",
                         1024,
                         [&]() { return exercise_unordered_map_rebind_explicit_state<Mode>(1, 1024, 256); });
+                add_case(rows, memory_mode_to_string(Mode), "tls_cache_thread_exit_reclaim", "char", 96, [&]() {
+                    return exercise_tls_cache_thread_exit_reclaim(96, 1);
+                });
             }
         }
     }

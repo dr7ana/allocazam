@@ -465,6 +465,7 @@ namespace allocazam {
 
         struct tls_run_node {
             tls_run_node* next;
+            runs_type* owner;
         };
 
         struct tls_run_class {
@@ -483,6 +484,21 @@ namespace allocazam {
 
         struct tls_run_cache {
             std::array<tls_run_class, tls_run_class_count> classes{};
+
+            ~tls_run_cache() {
+                for (auto& cls : classes) {
+                    tls_run_node* node = cls.head;
+                    while (node != nullptr) {
+                        tls_run_node* next = node->next;
+                        if (node->owner != nullptr) {
+                            node->owner->deallocate_bytes(static_cast<void*>(node));
+                        }
+                        node = next;
+                    }
+                    cls.head = nullptr;
+                    cls.count = 0;
+                }
+            }
         };
 
         inline static thread_local tls_run_cache _tls_run_cache{};
@@ -528,14 +544,35 @@ namespace allocazam {
             return *runs;
         }
 
-        static void _tls_push(size_t idx, void* p) noexcept {
+        static void _tls_push(size_t idx, void* p, runs_type* owner) noexcept {
+            assert(owner != nullptr && "tls cache owner must not be null");
             auto& cls = _tls_run_cache.classes[idx];
-            auto* node = std::construct_at(static_cast<tls_run_node*>(p), cls.head);
+            auto* node = std::construct_at(static_cast<tls_run_node*>(p), cls.head, owner);
             cls.head = node;
             ++cls.count;
         }
 
-        [[nodiscard]] static tls_run_node* _tls_pop(size_t idx) noexcept {
+        [[nodiscard]] static tls_run_node* _tls_pop_for_owner(size_t idx, runs_type* owner) noexcept {
+            auto& cls = _tls_run_cache.classes[idx];
+            tls_run_node* prev = nullptr;
+            for (tls_run_node* node = cls.head; node != nullptr; node = node->next) {
+                if (node->owner != owner) {
+                    prev = node;
+                    continue;
+                }
+
+                if (prev == nullptr) {
+                    cls.head = node->next;
+                } else {
+                    prev->next = node->next;
+                }
+                --cls.count;
+                return node;
+            }
+            return nullptr;
+        }
+
+        [[nodiscard]] static tls_run_node* _tls_pop_any(size_t idx) noexcept {
             auto& cls = _tls_run_cache.classes[idx];
             if (cls.head == nullptr) {
                 return nullptr;
@@ -549,11 +586,12 @@ namespace allocazam {
 
         void _tls_drain_class(size_t idx, size_t keep_count) noexcept {
             while (_tls_run_cache.classes[idx].count > keep_count) {
-                auto* node = _tls_pop(idx);
+                auto* node = _tls_pop_any(idx);
                 if (node == nullptr) {
                     break;
                 }
-                _runs().deallocate_bytes(static_cast<void*>(node));
+                assert(node->owner != nullptr && "tls cache node owner must not be null");
+                node->owner->deallocate_bytes(static_cast<void*>(node));
             }
         }
 
@@ -565,7 +603,10 @@ namespace allocazam {
 
         [[nodiscard]] T* _allocate_from_tls_run_cache(size_t bytes) {
             size_t idx = _tls_class_index_for(bytes);
-            if (auto* node = _tls_pop(idx); node != nullptr) {
+            runs_type* owner = _runs_ptr();
+            assert(owner != nullptr && "allocator runs must be initialized");
+
+            if (auto* node = _tls_pop_for_owner(idx, owner); node != nullptr) {
                 return reinterpret_cast<T*>(node);
             }
 
@@ -586,7 +627,7 @@ namespace allocazam {
                     if (extra == nullptr) {
                         break;
                     }
-                    _tls_push(idx, extra);
+                    _tls_push(idx, extra, owner);
                 }
             }
 
@@ -598,14 +639,14 @@ namespace allocazam {
             if (_tls_run_cache.classes[idx].count >= tls_high_watermark) {
                 _tls_drain_class(idx, tls_drain_low_watermark);
             }
-            _tls_push(idx, static_cast<void*>(p));
+            _tls_push(idx, static_cast<void*>(p), _runs_ptr());
         }
 
         static state_type& _default_state()
             requires(heap_backed_mode<Mode>)
         {
-            static state_type state{};
-            return state;
+            static state_type* state = new state_type{};
+            return *state;
         }
 
         state_type* _state{nullptr};
