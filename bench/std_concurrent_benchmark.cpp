@@ -116,7 +116,7 @@ namespace {
 
         double total_ns = run_concurrent_thread_timed_ns(threads, [&](size_t tid) {
             state_t state{pool_size, runner_bytes};
-            const alloc_t alloc{state};
+            alloc_t alloc{state};
 
             ns_t elapsed{};
             for (size_t base = 0; base < iterations; base += batch_iterations) {
@@ -207,7 +207,7 @@ namespace {
 
         double total_ns = run_concurrent_thread_timed_ns(threads, [&](size_t tid) {
             state_t state{pool_size, runner_bytes};
-            const alloc_t alloc{state};
+            alloc_t alloc{state};
 
             ns_t elapsed{};
             for (size_t base = 0; base < iterations; base += batch_iterations) {

@@ -1,0 +1,62 @@
+load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
+
+cc_library(
+    name = "bench_utils",
+    hdrs = ["utils.hpp"],
+    includes = ["."],
+    visibility = ["//visibility:public"],
+    deps = ["//:liballocazam"],
+)
+
+cc_library(
+    name = "std_allocator_bench_common",
+    hdrs = ["std_allocator_bench_common.hpp"],
+    includes = ["."],
+    deps = ["//:liballocazam"],
+)
+
+cc_binary(
+    name = "malloc_benchmark",
+    srcs = ["malloc_benchmark.cpp"],
+    deps = [
+        ":bench_utils",
+        "//:liballocazam",
+    ],
+)
+
+cc_binary(
+    name = "map_std_allocator_benchmark",
+    srcs = ["map_std_allocator_benchmark.cpp"],
+    deps = [":std_allocator_bench_common"],
+)
+
+cc_binary(
+    name = "runner_benchmark",
+    srcs = ["runner_benchmark.cpp"],
+    deps = ["//:liballocazam"],
+)
+
+cc_binary(
+    name = "std_concurrent_benchmark",
+    srcs = ["std_concurrent_benchmark.cpp"],
+    deps = [":std_allocator_bench_common"],
+)
+
+cc_binary(
+    name = "string_std_allocator_benchmark",
+    srcs = ["string_std_allocator_benchmark.cpp"],
+    deps = [":std_allocator_bench_common"],
+)
+
+cc_binary(
+    name = "unordered_map_std_allocator_benchmark",
+    srcs = ["unordered_map_std_allocator_benchmark.cpp"],
+    deps = [":std_allocator_bench_common"],
+)
+
+cc_binary(
+    name = "vector_std_allocator_benchmark",
+    srcs = ["vector_std_allocator_benchmark.cpp"],
+    deps = [":std_allocator_bench_common"],
+)

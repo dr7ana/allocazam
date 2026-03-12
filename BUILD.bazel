@@ -1,0 +1,20 @@
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
+
+cc_library(
+    name = "liballocazam",
+    srcs = glob(
+        [
+            "lib/*.cpp",
+            "lib/*.hpp",
+        ],
+        exclude = ["lib/allocazam.hpp"],
+    ),
+    hdrs = [
+        "lib/allocazam.hpp",
+    ],
+    includes = [
+        "lib",
+    ],
+    linkstatic = True,
+    visibility = ["//visibility:public"],
+)
