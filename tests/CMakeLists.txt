@@ -2,3 +2,13 @@ add_executable(allocazam_std_allocator_smoke std_allocator_smoke.cpp)
 target_link_libraries(allocazam_std_allocator_smoke PUBLIC liballocazam)
 target_include_directories(allocazam_std_allocator_smoke PRIVATE ${PROJECT_SOURCE_DIR}/bench)
 set_target_properties(allocazam_std_allocator_smoke PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+
+add_executable(allocazam_runner_expand_smoke runner_expand_smoke.cpp)
+target_link_libraries(allocazam_runner_expand_smoke PUBLIC liballocazam)
+target_include_directories(allocazam_runner_expand_smoke PRIVATE ${PROJECT_SOURCE_DIR}/bench)
+set_target_properties(allocazam_runner_expand_smoke PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+
+add_executable(allocazam_std_allocator_expand_smoke std_allocator_expand_smoke.cpp)
+target_link_libraries(allocazam_std_allocator_expand_smoke PUBLIC liballocazam)
+target_include_directories(allocazam_std_allocator_expand_smoke PRIVATE ${PROJECT_SOURCE_DIR}/bench)
+set_target_properties(allocazam_std_allocator_expand_smoke PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})

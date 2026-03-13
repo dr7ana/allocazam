@@ -101,21 +101,10 @@ namespace allocazam { namespace runner {
                 return nullptr;
             };
 
-            size_t payload = 0;
-            if (!detail::checked_add(bytes, run_alignment - 1, payload)) {
-                return fail_allocate();
-            }
-            payload &= ~(run_alignment - 1);
-
             size_t needed = 0;
-            if (!detail::checked_add(sizeof(run_header), payload, needed)) {
+            if (!_normalized_run_bytes_for_payload(bytes, needed)) {
                 return fail_allocate();
             }
-            if (!detail::checked_add(needed, run_alignment - 1, needed)) {
-                return fail_allocate();
-            }
-            needed &= ~(run_alignment - 1);
-            needed = std::ranges::max(needed, min_free_run_size);
             size_t scan_count = 0;
             run_header* h = _find_fit(needed, scan_count);
             if (h == nullptr) {
@@ -134,6 +123,75 @@ namespace allocazam { namespace runner {
                 _stats.granted_bytes += granted;
             }
             return out;
+        }
+
+        [[nodiscard]] size_t expand(void* p, size_t min_new_bytes) noexcept {
+            if (p == nullptr) {
+                return 0;
+            }
+
+            run_header* current = _header_from_payload(p);
+            assert(!_is_free(current) && "cannot expand a free run");
+
+            size_t current_run_size = _run_size(current);
+            size_t current_payload = current_run_size - sizeof(run_header);
+            if (current_payload >= min_new_bytes) {
+                return current_payload;
+            }
+
+            size_t needed = 0;
+            if (!_normalized_run_bytes_for_payload(min_new_bytes, needed)) {
+                return current_payload;
+            }
+
+            run_header* next = _next_run(current);
+            if (next == nullptr || !_is_free(next)) {
+                return current_payload;
+            }
+
+            size_t combined_size = 0;
+            if (!detail::checked_add(current_run_size, _run_size(next), combined_size)) {
+                return current_payload;
+            }
+            if (combined_size < needed) {
+                return current_payload;
+            }
+
+            bool prev_free = _prev_is_free(current);
+            _unlink_free(next);
+
+            size_t rem_size = combined_size - needed;
+            if (rem_size >= (min_free_run_size + split_remainder_threshold)) {
+                _set_header(current, needed, false, prev_free);
+
+                auto* rem = reinterpret_cast<run_header*>(reinterpret_cast<std::byte*>(current) + needed);
+                _set_header(rem, rem_size, true, false);
+                _write_footer(rem);
+                _link_free(rem);
+
+                run_header* next_after_rem = _next_run(rem);
+                if (next_after_rem != nullptr) {
+                    _set_prev_free(next_after_rem, true);
+                }
+            } else {
+                _set_header(current, combined_size, false, prev_free);
+                run_header* next_after_current = _next_run(current);
+                if (next_after_current != nullptr) {
+                    _set_prev_free(next_after_current, false);
+                }
+            }
+
+            size_t expanded_payload = _run_size(current) - sizeof(run_header);
+            if constexpr (collect_stats) {
+                if (expanded_payload > current_payload) {
+                    _stats.live_bytes += (expanded_payload - current_payload);
+                    if (_stats.live_bytes > _stats.peak_live_bytes) {
+                        _stats.peak_live_bytes = _stats.live_bytes;
+                    }
+                }
+            }
+
+            return expanded_payload;
         }
 
         void deallocate_bytes(void* p) noexcept {
@@ -189,6 +247,24 @@ namespace allocazam { namespace runner {
             static_assert(std::has_single_bit(run_alignment));
             size_t mask = alignment - 1;
             return (value + mask) & ~mask;
+        }
+
+        static constexpr bool _normalized_run_bytes_for_payload(size_t payload_bytes, size_t& out) noexcept {
+            size_t payload = 0;
+            if (!detail::checked_add(payload_bytes, run_alignment - 1, payload)) {
+                return false;
+            }
+            payload &= ~(run_alignment - 1);
+
+            if (!detail::checked_add(sizeof(run_header), payload, out)) {
+                return false;
+            }
+            if (!detail::checked_add(out, run_alignment - 1, out)) {
+                return false;
+            }
+            out &= ~(run_alignment - 1);
+            out = std::ranges::max(out, min_free_run_size);
+            return true;
         }
 
         /*

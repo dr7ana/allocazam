@@ -8,3 +8,21 @@ cc_test(
         "//bench:bench_utils",
     ],
 )
+
+cc_test(
+    name = "runner_expand_smoke",
+    srcs = ["runner_expand_smoke.cpp"],
+    deps = [
+        "//:liballocazam",
+        "//bench:bench_utils",
+    ],
+)
+
+cc_test(
+    name = "std_allocator_expand_smoke",
+    srcs = ["std_allocator_expand_smoke.cpp"],
+    deps = [
+        "//:liballocazam",
+        "//bench:bench_utils",
+    ],
+)

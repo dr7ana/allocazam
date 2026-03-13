@@ -135,6 +135,7 @@ namespace allocazam {
         [[nodiscard]] constexpr size_t size() const noexcept { return _size; }
         [[nodiscard]] constexpr size_t capacity() const noexcept { return _capacity; }
         [[nodiscard]] constexpr size_t free_count() const noexcept { return _capacity - _size; }
+        [[nodiscard]] constexpr bool owns(const T* ptr) const noexcept { return ptr != nullptr && _owns_pointer(ptr); }
 
         friend constexpr bool operator==(const allocazam&, const allocazam&) { return true; }
         friend constexpr bool operator!=(const allocazam&, const allocazam&) { return false; }
@@ -434,6 +435,25 @@ namespace allocazam {
             }
 
             _runs().deallocate_bytes(static_cast<void*>(p));
+        }
+
+        [[nodiscard]] size_t expand(T* p, size_t min_new_bytes) noexcept {
+            if (p == nullptr) {
+                return 0;
+            }
+
+            assert(_has_allocation_resource() && "allocator state must be initialized");
+
+            // n==1 allocate path routes to node pool, not runner; ensure node pool nodes are not expanded
+            if (_state != nullptr && _state->pool.owns(p)) {
+                return sizeof(T);
+            }
+
+            return _runs().expand(static_cast<void*>(p), min_new_bytes);
+        }
+
+        [[nodiscard]] size_t expand(void* p, size_t min_new_bytes) noexcept {
+            return expand(static_cast<T*>(p), min_new_bytes);
         }
 
         template <typename U, typename... args_t>
