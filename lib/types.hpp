@@ -18,6 +18,7 @@
 namespace allocazam {
     //
     enum class memory_mode : uint8_t { fixed, dynamic, noheap };
+    enum class huge_pages : uint8_t { disabled, enabled };
 
     namespace detail {
 

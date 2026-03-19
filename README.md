@@ -24,6 +24,40 @@ The implementation is split into three core layers:
 
 Mode selection is a template argument, and mode-specific behavior is constrained at compile time with concepts and `requires`.
 
+## Huge Pages
+
+Contiguous run allocation can also be configured at compile time with `huge_pages`:
+
+- `huge_pages::disabled`: default behavior
+- `huge_pages::enabled`: explicit Linux hugetlb mappings for allocator-owned runner chunks
+
+Current scope:
+
+- `huge_pages` is a template parameter on `allocazam::runner::allocator`, `allocazam_std_state`, and `allocazam_std_allocator`
+- `enabled` currently means explicit `2 MiB` huge pages via `MAP_HUGETLB | MAP_HUGE_2MB`
+- there is no fallback path; if hugetlb is enabled and the system is not configured for it, allocation fails
+- this only affects runner-owned contiguous allocations; the single-object node pool path remains normal-page-backed
+- caller-provided external backing spans are unchanged
+
+For std-allocator integration, hugetlb-enabled allocators must be constructed from explicit state:
+
+```cpp
+using state_t = allocazam::allocazam_std_state<
+        int,
+        allocazam::memory_mode::dynamic,
+        allocazam::huge_pages::enabled>;
+
+using alloc_t = allocazam::allocazam_std_allocator<
+        int,
+        allocazam::memory_mode::dynamic,
+        allocazam::huge_pages::enabled>;
+
+state_t state{4096, 2u << 20};
+alloc_t alloc{state};
+```
+
+The default-constructed std allocator remains available only for `huge_pages::disabled`.
+
 ## Pool Layer (`allocazam`)
 
 At the pool level, allocation of individual objects is node-based:
@@ -45,12 +79,13 @@ This keeps steady-state node operations simple while preserving mode-specific ow
 
 ## Runner Allocation Layer (`runner.hpp`)
 
-For larger contiguous requests (`n > 1` style paths), run allocation is handled by `allocazam::run_allocator`:
+For larger contiguous requests (`n > 1` style paths), run allocation is handled by `allocazam::runner::allocator`:
 
 - run headers encode size and coalescing flags
 - free runs are bucketed (linear lower bins + logarithmic upper bins)
 - non-empty bins are tracked with bitmasks for fast candidate lookup
 - splitting/coalescing maintains reuse and limits external fragmentation
+- allocator-owned runner chunks can optionally be backed by explicit `2 MiB` hugetlb mappings
 
 This layer is designed for contiguous region management, complementing the single-node free-list path in `allocazam`.
 

@@ -261,31 +261,31 @@ namespace allocazam {
     template <typename T>
     using noheap_allocazam = allocazam<T, memory_mode::noheap>;
 
-    template <typename T, memory_mode Mode = memory_mode::dynamic>
+    template <typename T, memory_mode Mode = memory_mode::dynamic, huge_pages Huge = huge_pages::disabled>
     struct allocazam_std_state;
 
-    template <typename T>
-    struct alignas(detail::cache_line_size) allocazam_std_state<T, memory_mode::fixed> {
+    template <typename T, huge_pages Huge>
+    struct alignas(detail::cache_line_size) allocazam_std_state<T, memory_mode::fixed, Huge> {
         allocazam<T, memory_mode::fixed> pool;
-        runner::allocator<false> runs;
+        runner::allocator<false, false, Huge> runs;
 
         explicit allocazam_std_state(size_t pool_size = 4096)
                 : pool(pool_size), runs(std::ranges::max(pool_size * sizeof(T), size_t{4096})) {}
     };
 
-    template <typename T>
-    struct alignas(detail::cache_line_size) allocazam_std_state<T, memory_mode::dynamic> {
+    template <typename T, huge_pages Huge>
+    struct alignas(detail::cache_line_size) allocazam_std_state<T, memory_mode::dynamic, Huge> {
         allocazam<T, memory_mode::dynamic> pool;
-        runner::allocator<true> runs;
+        runner::allocator<true, false, Huge> runs;
 
         explicit allocazam_std_state(size_t pool_size = 4096, size_t runner_bytes = 65536)
                 : pool(pool_size), runs(runner_bytes) {}
     };
 
-    template <typename T>
-    struct alignas(detail::cache_line_size) allocazam_std_state<T, memory_mode::noheap> {
+    template <typename T, huge_pages Huge>
+    struct alignas(detail::cache_line_size) allocazam_std_state<T, memory_mode::noheap, Huge> {
         allocazam<T, memory_mode::noheap> pool;
-        runner::allocator<false> runs;
+        runner::allocator<false, false, Huge> runs;
 
         explicit allocazam_std_state(std::span<std::byte> node_backing, std::span<std::byte> run_backing)
                 : pool(node_backing), runs(run_backing) {}
@@ -296,12 +296,15 @@ namespace allocazam {
                           backing.subspan(backing.size() / 2, backing.size() - (backing.size() / 2))) {}
     };
 
-    template <typename T, memory_mode Mode = memory_mode::dynamic>
+    template <typename T, memory_mode Mode = memory_mode::dynamic, huge_pages Huge = huge_pages::disabled>
     class allocazam_std_allocator {
       public:
         using value_type = T;
-        using state_type = allocazam_std_state<T, Mode>;
-        using runs_type = std::conditional_t<dynamic_mode<Mode>, runner::allocator<true>, runner::allocator<false>>;
+        using state_type = allocazam_std_state<T, Mode, Huge>;
+        using runs_type = std::conditional_t<
+                dynamic_mode<Mode>,
+                runner::allocator<true, false, Huge>,
+                runner::allocator<false, false, Huge>>;
         static constexpr size_t linear_cache_cutoff = 4096;
 
         using propagate_on_container_copy_assignment = std::true_type;
@@ -320,24 +323,24 @@ namespace allocazam {
 
         template <typename U>
         struct rebind {
-            using other = allocazam_std_allocator<U, Mode>;
+            using other = allocazam_std_allocator<U, Mode, Huge>;
         };
 
         constexpr allocazam_std_allocator()
-            requires(heap_backed_mode<Mode>)
+            requires(heap_backed_mode<Mode> && Huge == huge_pages::disabled)
                 : _state{&_default_state()}, _runs_override{nullptr}, _tls_enabled{true} {}
 
         constexpr explicit allocazam_std_allocator(state_type& state) noexcept
                 : _state{&state}, _runs_override{nullptr}, _tls_enabled{false} {}
 
         template <typename U>
-        constexpr allocazam_std_allocator(const allocazam_std_allocator<U, Mode>& other) noexcept
+        constexpr allocazam_std_allocator(const allocazam_std_allocator<U, Mode, Huge>& other) noexcept
                 : _state{nullptr}, _runs_override{other._runs_ptr()}, _tls_enabled{false} {
             assert(_runs_override != nullptr && "rebind source allocator must be initialized");
         }
 
         template <typename U>
-        constexpr allocazam_std_allocator(const allocazam_std_allocator<U, Mode>&, state_type& state) noexcept
+        constexpr allocazam_std_allocator(const allocazam_std_allocator<U, Mode, Huge>&, state_type& state) noexcept
                 : _state{&state}, _runs_override{nullptr}, _tls_enabled{false} {}
 
         [[nodiscard]] T* allocate(size_t n) {
@@ -481,7 +484,7 @@ namespace allocazam {
         }
 
       private:
-        template <typename U, memory_mode OtherMode>
+        template <typename U, memory_mode OtherMode, huge_pages OtherHuge>
         friend class allocazam_std_allocator;
 
         struct tls_run_node {
@@ -663,7 +666,7 @@ namespace allocazam {
         }
 
         static state_type& _default_state()
-            requires(heap_backed_mode<Mode>)
+            requires(heap_backed_mode<Mode> && Huge == huge_pages::disabled)
         {
             static state_type* state = new state_type{};
             return *state;

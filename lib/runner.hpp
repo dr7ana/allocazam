@@ -2,12 +2,29 @@
 
 #include "types.hpp"
 
+#include <expected>
 #include <limits>
 #include <span>
 
+#if defined(__linux__)
+#include <sys/mman.h>
+
+#ifndef MAP_HUGE_SHIFT
+#define MAP_HUGE_SHIFT 26
+#endif
+
+#ifndef MAP_HUGE_2MB
+#define MAP_HUGE_2MB (21U << MAP_HUGE_SHIFT)
+#endif
+#endif
+
 namespace allocazam { namespace runner {
-    template <bool CanGrow, bool CollectStats = false>
+    template <bool CanGrow, bool CollectStats = false, huge_pages Huge = huge_pages::disabled>
     class alignas(detail::cache_line_size) allocator {
+#if !defined(__linux__)
+        static_assert(Huge == huge_pages::disabled, "explicit hugetlb runner support requires Linux");
+#endif
+
         struct run_header {
             size_t size_and_flags;
         };
@@ -20,8 +37,19 @@ namespace allocazam { namespace runner {
         struct chunk_node {
             std::byte* begin;
             size_t bytes;
-            std::byte* raw;
+            std::byte* mapping_base;
+            size_t mapping_bytes;
             chunk_node* next;
+        };
+
+        struct owned_arena {
+            std::byte* base;
+            size_t bytes;
+        };
+
+        enum class arena_error : uint8_t {
+            out_of_memory,
+            hugetlb_failed,
         };
 
         static constexpr size_t run_alignment{alignof(std::max_align_t)};
@@ -43,6 +71,8 @@ namespace allocazam { namespace runner {
         static constexpr size_t flag_mask{flag_is_free | flag_prev_is_free};
         static constexpr bool can_grow{CanGrow};
         static constexpr bool collect_stats{CollectStats};
+        static constexpr bool use_huge_pages{Huge == huge_pages::enabled};
+        static constexpr size_t explicit_huge_page_bytes{size_t{2} << 20};
 
       public:
         struct stats_t {
@@ -64,7 +94,7 @@ namespace allocazam { namespace runner {
 
         explicit allocator(size_t initial_bytes = 65536)
                 : _page_size{detail::detect_page_size()}, _next_growth{std::ranges::max(initial_bytes, size_t{65536})} {
-            _add_owned_chunk(initial_bytes);
+            _next_growth = _add_owned_chunk(initial_bytes);
         }
 
         explicit allocator(std::span<std::byte> backing) : _page_size{detail::detect_page_size()}, _next_growth{0} {
@@ -247,6 +277,69 @@ namespace allocazam { namespace runner {
             static_assert(std::has_single_bit(run_alignment));
             size_t mask = alignment - 1;
             return (value + mask) & ~mask;
+        }
+
+        [[nodiscard]] constexpr size_t _owned_chunk_granularity() const noexcept {
+            if constexpr (use_huge_pages) {
+                return explicit_huge_page_bytes;
+            } else {
+                return _page_size;
+            }
+        }
+
+        [[nodiscard]] constexpr size_t _owned_chunk_bytes_for(size_t bytes) const {
+            size_t rounded_input = std::ranges::max(bytes, min_chunk_bytes);
+            size_t chunk_bytes = 0;
+            if (!detail::checked_round_to_multiple_of(rounded_input, _owned_chunk_granularity(), chunk_bytes)) {
+                throw std::bad_alloc{};
+            }
+            return chunk_bytes;
+        }
+
+        [[nodiscard]] static std::expected<owned_arena, arena_error> _allocate_owned_arena(
+                size_t chunk_bytes) noexcept {
+            if constexpr (use_huge_pages) {
+#if defined(__linux__)
+                void* mapping =
+                        ::mmap(nullptr,
+                               chunk_bytes,
+                               PROT_READ | PROT_WRITE,
+                               MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_HUGE_2MB,
+                               -1,
+                               0);
+                if (mapping == MAP_FAILED) {
+                    return std::unexpected{arena_error::hugetlb_failed};
+                }
+                return owned_arena{static_cast<std::byte*>(mapping), chunk_bytes};
+#else
+                (void)chunk_bytes;
+                return std::unexpected{arena_error::hugetlb_failed};
+#endif
+            } else {
+                auto* raw = static_cast<std::byte*>(
+                        ::operator new[](chunk_bytes, std::align_val_t{run_alignment}, std::nothrow));
+                if (raw == nullptr) {
+                    return std::unexpected{arena_error::out_of_memory};
+                }
+                return owned_arena{raw, chunk_bytes};
+            }
+        }
+
+        static void _release_owned_arena(std::byte* mapping_base, size_t mapping_bytes) noexcept {
+            if (mapping_base == nullptr) {
+                return;
+            }
+
+            if constexpr (use_huge_pages) {
+#if defined(__linux__)
+                ::munmap(static_cast<void*>(mapping_base), mapping_bytes);
+#else
+                (void)mapping_bytes;
+#endif
+            } else {
+                (void)mapping_bytes;
+                ::operator delete[](mapping_base, std::align_val_t{run_alignment});
+            }
         }
 
         static constexpr bool _normalized_run_bytes_for_payload(size_t payload_bytes, size_t& out) noexcept {
@@ -514,11 +607,10 @@ namespace allocazam { namespace runner {
                 throw std::bad_alloc{};
             }
 
-            size_t chunk_bytes = std::ranges::max(_next_growth, needed_with_overhead);
-            _add_owned_chunk(chunk_bytes);
+            size_t chunk_bytes = _add_owned_chunk(std::ranges::max(_next_growth, needed_with_overhead));
 
             size_t doubled_growth = 0;
-            if (!detail::checked_mul(_next_growth, size_t{2}, doubled_growth)) {
+            if (!detail::checked_mul(chunk_bytes, size_t{2}, doubled_growth)) {
                 doubled_growth = std::numeric_limits<size_t>::max();
             }
             _next_growth = std::ranges::max(doubled_growth, chunk_bytes);
@@ -535,34 +627,24 @@ namespace allocazam { namespace runner {
             _set_header(epilogue, 0, false, true);
         }
 
-        void _add_owned_chunk(size_t bytes) {
-            size_t rounded_input = std::ranges::max(bytes, min_chunk_bytes);
-            size_t chunk_bytes = 0;
-            if (!detail::checked_round_to_multiple_of(rounded_input, _page_size, chunk_bytes)) {
+        [[nodiscard]] size_t _add_owned_chunk(size_t bytes) {
+            size_t chunk_bytes = _owned_chunk_bytes_for(bytes);
+            auto* c = new chunk_node{};
+            std::expected<owned_arena, arena_error> arena = _allocate_owned_arena(chunk_bytes);
+            if (!arena) {
+                delete c;
                 throw std::bad_alloc{};
             }
 
-            size_t overhead_bytes = 0;
-            if (!detail::checked_add(sizeof(chunk_node), run_alignment - 1, overhead_bytes)) {
-                throw std::bad_alloc{};
-            }
-
-            size_t total_bytes = 0;
-            if (!detail::checked_add(overhead_bytes, chunk_bytes, total_bytes)) {
-                throw std::bad_alloc{};
-            }
-
-            auto* raw = static_cast<std::byte*>(::operator new[](total_bytes, std::align_val_t{run_alignment}));
-            auto* c = reinterpret_cast<chunk_node*>(raw);
-            std::byte* begin = _align_up_ptr(raw + sizeof(chunk_node), run_alignment);
-
-            c->begin = begin;
-            c->bytes = chunk_bytes;
-            c->raw = raw;
+            c->mapping_base = arena->base;
+            c->begin = arena->base;
+            c->bytes = arena->bytes;
+            c->mapping_bytes = arena->bytes;
             c->next = _chunks_head;
             _chunks_head = c;
 
             _initialize_free_run(c);
+            return chunk_bytes;
         }
 
         void _add_external_chunk(std::span<std::byte> backing) {
@@ -583,7 +665,8 @@ namespace allocazam { namespace runner {
 
             _external_chunk.begin = static_cast<std::byte*>(aligned);
             _external_chunk.bytes = chunk_bytes;
-            _external_chunk.raw = nullptr;
+            _external_chunk.mapping_base = nullptr;
+            _external_chunk.mapping_bytes = 0;
             _external_chunk.next = _chunks_head;
             _chunks_head = &_external_chunk;
 
@@ -593,8 +676,9 @@ namespace allocazam { namespace runner {
         void _release_owned_chunks() noexcept {
             for (chunk_node* c = _chunks_head; c != nullptr;) {
                 chunk_node* next = c->next;
-                if (c->raw != nullptr) {
-                    ::operator delete[](c->raw, std::align_val_t{run_alignment});
+                if (c->mapping_base != nullptr) {
+                    _release_owned_arena(c->mapping_base, c->mapping_bytes);
+                    delete c;
                 }
                 c = next;
             }
