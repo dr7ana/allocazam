@@ -1,5 +1,7 @@
 # allocazam
 
+[![CI](https://github.com/dr7ana/allocazam/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/dr7ana/allocazam/actions/workflows/ci.yml)
+
 `allocazam` is a C++23 hybrid freelist allocator with size-segregated bins, optimized for predictable, deterministic low-latency allocation.
 
 This repository is under active development (read: "I'm tinkering"); internals and APIs may continue to change (read: "break").

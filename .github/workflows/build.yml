@@ -1,0 +1,41 @@
+name: Build
+
+on:
+  workflow_call:
+
+jobs:
+  build:
+    name: linux-x86_64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install LLVM (Linux)
+        run: |
+          wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 21 all
+          sudo update-alternatives --install /usr/bin/clang   clang   /usr/bin/clang-21 100
+          sudo update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-21 100
+
+      - name: Configure
+        run: |
+          cmake -B build -G "Unix Makefiles" \
+            -DCMAKE_C_COMPILER=clang-21 \
+            -DCMAKE_CXX_COMPILER=clang++-21 \
+            -DCMAKE_COMPILE_WARNING_AS_ERROR=ON \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DALLOCAZAM_BUILD_TESTS=ON
+
+      - name: Build
+        run: make -j
+        working-directory: ./build
+
+      - name: Test
+        run: |
+          ./build/allocazam_std_allocator_smoke
+          ./build/allocazam_runner_expand_smoke
+          ./build/allocazam_std_allocator_expand_smoke
