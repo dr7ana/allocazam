@@ -20,6 +20,10 @@ jobs:
           sudo update-alternatives --install /usr/bin/clang   clang   /usr/bin/clang-21 100
           sudo update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-21 100
 
+      - name: Enable 2MiB Huge Pgaes
+        run: |
+          echo 128 | sudo tee /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
+
       - name: Configure
         run: |
           cmake -B build -G "Unix Makefiles" \
