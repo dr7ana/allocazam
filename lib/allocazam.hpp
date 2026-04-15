@@ -525,7 +525,10 @@ namespace allocazam {
             }
         };
 
-        inline static thread_local tls_run_cache _tls_run_cache{};
+        static tls_run_cache& thread_local_cache() {
+            static thread_local tls_run_cache _tls_run_cache{};
+            return _tls_run_cache;
+        }
 
         [[nodiscard]] static constexpr size_t _tls_align_up(size_t bytes) noexcept {
             size_t mask = tls_run_quantum - 1;
@@ -570,14 +573,14 @@ namespace allocazam {
 
         static void _tls_push(size_t idx, void* p, runs_type* owner) noexcept {
             assert(owner != nullptr && "tls cache owner must not be null");
-            auto& cls = _tls_run_cache.classes[idx];
+            auto& cls = thread_local_cache().classes[idx];
             auto* node = std::construct_at(static_cast<tls_run_node*>(p), cls.head, owner);
             cls.head = node;
             ++cls.count;
         }
 
         [[nodiscard]] static tls_run_node* _tls_pop_for_owner(size_t idx, runs_type* owner) noexcept {
-            auto& cls = _tls_run_cache.classes[idx];
+            auto& cls = thread_local_cache().classes[idx];
             tls_run_node* prev = nullptr;
             for (tls_run_node* node = cls.head; node != nullptr; node = node->next) {
                 if (node->owner != owner) {
@@ -597,7 +600,7 @@ namespace allocazam {
         }
 
         [[nodiscard]] static tls_run_node* _tls_pop_any(size_t idx) noexcept {
-            auto& cls = _tls_run_cache.classes[idx];
+            auto& cls = thread_local_cache().classes[idx];
             if (cls.head == nullptr) {
                 return nullptr;
             }
@@ -609,7 +612,7 @@ namespace allocazam {
         }
 
         void _tls_drain_class(size_t idx, size_t keep_count) noexcept {
-            while (_tls_run_cache.classes[idx].count > keep_count) {
+            while (thread_local_cache().classes[idx].count > keep_count) {
                 auto* node = _tls_pop_any(idx);
                 if (node == nullptr) {
                     break;
@@ -659,7 +662,7 @@ namespace allocazam {
 
         void _deallocate_to_tls_run_cache(T* p, size_t bytes) noexcept {
             size_t idx = _tls_class_index_for(bytes);
-            if (_tls_run_cache.classes[idx].count >= tls_high_watermark) {
+            if (thread_local_cache().classes[idx].count >= tls_high_watermark) {
                 _tls_drain_class(idx, tls_drain_low_watermark);
             }
             _tls_push(idx, static_cast<void*>(p), _runs_ptr());
