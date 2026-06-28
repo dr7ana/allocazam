@@ -7,7 +7,7 @@ jobs:
   build:
     name: ${{ matrix.os }} (${{ matrix.compiler }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    timeout-minutes: 10
     env:
       CC: ${{ matrix.cc }}
       CXX: ${{ matrix.cxx }}
@@ -41,16 +41,6 @@ jobs:
         with:
           submodules: recursive
 
-  build:
-    name: linux-x86_64
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-
       - name: Install LLVM (Linux)
         if: ${{ matrix.install_llvm }}
         run: |
@@ -64,7 +54,7 @@ jobs:
           sudo add-apt-repository ppa:ubuntu-toolchain-r/test
           sudo apt update -yqq
           versions=$(apt-cache pkgnames | sed -nr 's/^gcc-(([0-9]+\.?)+)$/\1/p' | sort -n)
-          latest_version =$($versions | tail -n1)
+          latest_version=$($versions | tail -n1)
           echo "Latest available GCC version: $latest_version"
           echo "All available GCC versions: $versions"
           ls -la /usr/bin | grep gcc
@@ -87,13 +77,24 @@ jobs:
             -DCMAKE_CXX_COMPILER=${{ matrix.cxx }} \
             -DCMAKE_BUILD_TYPE=Release
 
-      - name: Build
+      - name: Build Debug
         run: make -j
-        working-directory: ./build
+        working-directory: ./build_dbg
 
-      - name: Test
+      - name: Test Debug
         run: |
           ./tests/allocazam_std_allocator_smoke
           ./tests/allocazam_runner_expand_smoke
           ./tests/allocazam_std_allocator_expand_smoke
-        working-directory: ./build
+        working-directory: ./build_dbg
+
+      - name: Build Release
+        run: make -j
+        working-directory: ./build_rel
+
+      - name: Test Release
+        run: |
+          ./tests/allocazam_std_allocator_smoke
+          ./tests/allocazam_runner_expand_smoke
+          ./tests/allocazam_std_allocator_expand_smoke
+        working-directory: ./build_rel
