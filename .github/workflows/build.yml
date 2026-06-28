@@ -5,6 +5,43 @@ on:
 
 jobs:
   build:
+    name: ${{ matrix.os }} (${{ matrix.compiler }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    env:
+      CC: ${{ matrix.cc }}
+      CXX: ${{ matrix.cxx }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+        compiler: [clang-22, gcc-14, gcc-15]
+        include:
+          - compiler: clang-22
+            cc: clang-22
+            cxx: clang++-22
+            install_llvm: true
+            install_gcc: false
+            use_libcxx: ON
+          - compiler: gcc-14
+            cc: gcc-14
+            cxx: g++-14
+            install_llvm: false
+            install_gcc: true
+            use_libcxx: OFF
+          - compiler: gcc-15
+            cc: gcc-15
+            cxx: g++-15
+            install_llvm: false
+            install_gcc: true
+            use_libcxx: OFF
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+  build:
     name: linux-x86_64
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -15,24 +52,40 @@ jobs:
           submodules: recursive
 
       - name: Install LLVM (Linux)
+        if: ${{ matrix.install_llvm }}
         run: |
-          wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 21 all
-          sudo update-alternatives --install /usr/bin/clang   clang   /usr/bin/clang-21 100
-          sudo update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-21 100
+          wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 22 all
+          sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-22 100
+          sudo update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-22 100
 
-      - name: Enable 2MiB Huge Pgaes
+      - name: Install gcc (Linux)
+        if: ${{ matrix.install_gcc }}
+        run: |
+          sudo add-apt-repository ppa:ubuntu-toolchain-r/test
+          sudo apt update -yqq
+          versions=$(apt-cache pkgnames | sed -nr 's/^gcc-(([0-9]+\.?)+)$/\1/p' | sort -n)
+          latest_version =$($versions | tail -n1)
+          echo "Latest available GCC version: $latest_version"
+          echo "All available GCC versions: $versions"
+          ls -la /usr/bin | grep gcc
+          sudo apt install -yqq ${{ matrix.cc }} ${{ matrix.cxx }}
+          sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/${{ matrix.cc }} 100
+          sudo update-alternatives --install /usr/bin/g++ g++ /usr/bin/${{ matrix.cxx }} 100
+
+      - name: Enable 2MiB Huge Pages
         run: |
           echo 128 | sudo tee /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
 
       - name: Configure
         run: |
-          cmake -B build -G "Unix Makefiles" \
-            -DCMAKE_C_COMPILER=clang-21 \
-            -DCMAKE_CXX_COMPILER=clang++-21 \
-            -DCMAKE_COMPILE_WARNING_AS_ERROR=ON \
-            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DALLOCAZAM_BUILD_TESTS=ON
+          cmake -B build_dbg -G "Unix Makefiles" \
+            -DCMAKE_C_COMPILER=${{ matrix.cc }} \
+            -DCMAKE_CXX_COMPILER=${{ matrix.cxx }} \
+            -DCMAKE_BUILD_TYPE=Debug
+          cmake -B build_rel -G "Unix Makefiles" \
+            -DCMAKE_C_COMPILER=${{ matrix.cc }} \
+            -DCMAKE_CXX_COMPILER=${{ matrix.cxx }} \
+            -DCMAKE_BUILD_TYPE=Release
 
       - name: Build
         run: make -j
