@@ -26,3 +26,12 @@ cc_test(
         "//bench:bench_utils",
     ],
 )
+
+cc_test(
+    name = "concurrent_stress",
+    srcs = ["concurrent_stress.cpp"],
+    deps = [
+        "//:liballocazam",
+        "//bench:bench_utils",
+    ],
+)

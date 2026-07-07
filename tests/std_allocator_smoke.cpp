@@ -2,6 +2,7 @@
 #include "utils.hpp"
 
 #include <algorithm>
+#include <barrier>
 #include <deque>
 #include <iomanip>
 #include <limits>
@@ -9,6 +10,13 @@
 #include <map>
 #include <thread>
 #include <unordered_map>
+
+#if !defined(NDEBUG) && defined(__linux__)
+#include <sys/wait.h>
+#include <unistd.h>
+
+#include <csignal>
+#endif
 
 namespace {
     template <size_t Words>
@@ -26,8 +34,10 @@ namespace {
     };
 
     using obj16 = blob_object<2>;
+    using obj24 = blob_object<3>;
     using obj64 = blob_object<8>;
     using obj256 = blob_object<32>;
+    using obj4k = blob_object<512>;
 
     struct smoke_row {
         std::string mode;
@@ -59,8 +69,18 @@ namespace {
     }
 
     template <>
+    constexpr std::string_view type_name_of<obj24>() noexcept {
+        return "obj24";
+    }
+
+    template <>
     constexpr std::string_view type_name_of<obj64>() noexcept {
         return "obj64";
+    }
+
+    template <>
+    constexpr std::string_view type_name_of<obj4k>() noexcept {
+        return "obj4k";
     }
 
     template <>
@@ -473,6 +493,359 @@ namespace {
         return "inserted=" + std::to_string(inserted);
     }
 
+    template <typename T>
+    std::string exercise_granule_headers(size_t initial_count, size_t alloc_count) {
+        using pool_t = allocazam::allocazam<T, allocazam::memory_mode::dynamic, true>;
+        pool_t pool{initial_count};
+
+        size_t granule = pool_t::granule_bytes(allocazam::detail::detect_page_size());
+        require(std::has_single_bit(granule), "granule must be a power of 2");
+
+        std::vector<T*> ptrs;
+        ptrs.reserve(alloc_count);
+        std::ranges::for_each(std::views::iota(size_t{0}, alloc_count), [&](size_t) {
+            T* p = pool.allocate();
+            require(p != nullptr, "headered pool allocate returned null");
+
+            auto* header =
+                    reinterpret_cast<const allocazam::granule_header*>(reinterpret_cast<uintptr_t>(p) & ~(granule - 1));
+            require(header->owner == &pool, "granule mask must resolve the owning pool");
+            require(header->debug_tag == allocazam::granule_debug_tag, "granule debug tag mismatch");
+            ptrs.push_back(p);
+        });
+
+        require(pool.capacity() > initial_count, "exercise must span chunk growth");
+        std::ranges::for_each(ptrs, [&](T* p) { pool.deallocate(p); });
+        require(pool.size() == 0, "all nodes must return to the pool");
+
+        return "granule=" + std::to_string(granule) + " cap=" + std::to_string(pool.capacity());
+    }
+
+    template <allocazam::memory_mode Mode>
+    std::string exercise_pool_remote_drain(size_t initial_count) {
+        using pool_t = allocazam::allocazam<int, Mode, true>;
+        pool_t pool{initial_count};
+        size_t cap = pool.capacity();
+        require(cap == initial_count, "requested capacity must be exact, not granule-rounded");
+
+        std::vector<int*> ptrs;
+        ptrs.reserve(cap);
+        std::ranges::for_each(std::views::iota(size_t{0}, cap), [&](size_t) {
+            int* p = pool.allocate();
+            require(p != nullptr, "headered pool allocate returned null before exhaustion");
+            ptrs.push_back(p);
+        });
+
+        if constexpr (Mode == allocazam::memory_mode::fixed) {
+            require(pool.allocate() == nullptr, "exhausted fixed pool must return nullptr");
+        }
+
+        std::ranges::for_each(ptrs, [&](int* p) { pool.remote_push(p); });
+        require(pool.size() == cap, "remotely parked nodes must count as live until drain");
+
+        int* p = pool.allocate();
+        require(p != nullptr, "drain must satisfy allocation with all nodes parked remotely");
+        require(pool.capacity() == cap, "drain must satisfy allocation without growth");
+        require(pool.size() == 1, "drain must reconcile size accounting");
+        pool.deallocate(p);
+
+        return "cap=" + std::to_string(cap);
+    }
+
+    // test case 2 + 3: alloc on A to exact capacity, free on B (routes remotely), A
+    // allocates again — the drain must satisfy it before growth, with every node
+    // accounted. oracle: state() on the worker plus registry introspection
+    template <allocazam::memory_mode Mode>
+    std::string exercise_cross_thread_free_drain() {
+        using alloc_t = allocazam::allocazam_std_allocator<int, Mode>;
+        using state_t = typename alloc_t::state_type;
+
+        std::barrier<> sync{2};
+        state_t* worker_state = nullptr;
+        std::vector<int*> ptrs;
+        size_t cap = 0;
+        std::string worker_error;
+
+        std::thread worker{[&] {
+            try {
+                alloc_t alloc{};
+                state_t* s = alloc.state();
+                worker_state = s;
+
+                ptrs.push_back(alloc.allocate(1));
+                cap = s->pool.capacity();
+                while (ptrs.size() < cap) {
+                    ptrs.push_back(alloc.allocate(1));
+                }
+                require(s->pool.size() == cap, "worker must hold every node before handoff");
+            } catch (const std::exception& e) {
+                worker_error = e.what();
+            }
+            sync.arrive_and_wait();
+            sync.arrive_and_wait();
+            if (!worker_error.empty()) {
+                return;
+            }
+            try {
+                alloc_t alloc{};
+                require(worker_state->pool.size() == cap, "remotely freed nodes must count live until drain");
+                int* p = alloc.allocate(1);
+                require(p != nullptr, "allocation after remote frees must succeed");
+                require(worker_state->pool.capacity() == cap, "drain must satisfy allocation before growth");
+                require(worker_state->pool.size() == 1, "every remotely freed node must be accounted for");
+                alloc.deallocate(p, 1);
+            } catch (const std::exception& e) {
+                worker_error = e.what();
+            }
+        }};
+
+        sync.arrive_and_wait();
+        if (worker_error.empty()) {
+            alloc_t alloc{};
+            std::ranges::for_each(ptrs, [&](int* p) { alloc.deallocate(p, 1); });
+        }
+        sync.arrive_and_wait();
+        worker.join();
+        require(worker_error.empty(), worker_error.c_str());
+
+        bool found = false;
+        for (state_t* s = alloc_t::thread_state_registry(); s != nullptr; s = s->registry_next) {
+            found = found || (s == worker_state);
+        }
+        require(found, "worker state must be registry-reachable");
+
+        return "cap=" + std::to_string(cap);
+    }
+
+    // test case 4: thread exits with outstanding allocations; remote frees land after
+    // exit with no use-after-free — the registry holds the orphaned state
+    std::string exercise_orphaned_state_safety(size_t count) {
+        using alloc_t = allocazam::allocazam_std_allocator<obj16, allocazam::memory_mode::dynamic>;
+        using state_t = alloc_t::state_type;
+
+        std::vector<obj16*> ptrs(count, nullptr);
+        state_t* worker_state = nullptr;
+
+        std::thread worker{[&] {
+            alloc_t alloc{};
+            std::ranges::for_each(ptrs, [&](obj16*& p) { p = alloc.allocate(1); });
+            worker_state = alloc.state();
+        }};
+        worker.join();
+
+        require(worker_state != nullptr, "worker state must exist");
+        require(worker_state->pool.size() == count, "orphaned state must hold the outstanding nodes");
+
+        bool found = false;
+        for (state_t* s = alloc_t::thread_state_registry(); s != nullptr; s = s->registry_next) {
+            found = found || (s == worker_state);
+        }
+        require(found, "orphaned state must stay registry-reachable");
+
+        alloc_t alloc{};
+        std::ranges::for_each(ptrs, [&](obj16* p) { alloc.deallocate(p, 1); });
+        require(worker_state->pool.size() == count, "remotely parked nodes count live until the owner drains");
+
+        return "count=" + std::to_string(count);
+    }
+
+    // test case 7: state() thread-locality, stability, rebind resolution, first touch
+    std::string exercise_state_semantics() {
+        using alloc_t = allocazam::allocazam_std_allocator<obj64, allocazam::memory_mode::dynamic>;
+        using state_t = alloc_t::state_type;
+        using rebound_t = alloc_t::rebind<obj256>::other;
+
+        alloc_t a{};
+        state_t* s1 = a.state();
+        require(s1 != nullptr, "state() must create the thread's state on first touch");
+        require(a.state() == s1, "state() must be stable within a thread");
+
+        alloc_t b{};
+        require(b.state() == s1, "same thread and instantiation must resolve the same state");
+
+        state_t* worker_seen = nullptr;
+        std::thread worker{[&] {
+            alloc_t c{};
+            worker_seen = c.state();
+        }};
+        worker.join();
+        require(worker_seen != nullptr, "worker state() must create");
+        require(worker_seen != s1, "distinct threads must see distinct states");
+
+        rebound_t rebound_stateless{a};
+        auto* ru = rebound_stateless.state();
+        require(ru != nullptr, "rebound-from-stateless must resolve the thread's U state");
+        rebound_t direct{};
+        require(direct.state() == ru, "rebound resolution must equal direct default resolution");
+
+        state_t bound_state{64, 65536};
+        alloc_t bound{bound_state};
+        require(bound.state() == &bound_state, "explicit binding must return the bound state");
+        rebound_t rebound_explicit{bound};
+        require(rebound_explicit.state() == nullptr, "rebound-from-explicit holds no state_type");
+
+        return "ok";
+    }
+
+    // allocator equality is the deallocation-interchange contract: post-flip, two
+    // stateless allocators are {null, null} and interchange on any thread via owner
+    // routing; explicit and runs-override bindings interchange only with their own kind
+    std::string exercise_allocator_equality() {
+        using alloc_t = allocazam::allocazam_std_allocator<obj64, allocazam::memory_mode::dynamic>;
+        using state_t = alloc_t::state_type;
+        using rebound_t = alloc_t::rebind<obj256>::other;
+
+        alloc_t a{};
+        alloc_t b{};
+        require(a == b, "stateless allocators must compare equal");
+
+        state_t s1{64, 65536};
+        state_t s2{64, 65536};
+        alloc_t e1{s1};
+        alloc_t e1_alias{s1};
+        alloc_t e2{s2};
+        require(e1 == e1_alias, "allocators bound to the same state must compare equal");
+        require(e1 != e2, "allocators bound to distinct states must compare unequal");
+        require(a != e1, "stateless and explicit-state allocators must compare unequal");
+
+        rebound_t r1{e1};
+        rebound_t r1_alias{e1};
+        rebound_t r2{e2};
+        require(r1 == r1_alias, "rebinds sharing a runs override must compare equal");
+        require(r1 != r2, "rebinds over distinct runs overrides must compare unequal");
+
+        rebound_t rs{a};
+        rebound_t rs_direct{};
+        require(rs == rs_direct, "rebound-from-stateless must stay stateless and compare equal");
+        require(rs != r1, "stateless and runs-override rebinds must compare unequal");
+
+        return "ok";
+    }
+
+    // test case 8: routed frees into an explicit pool recycle at the owner's next
+    // empty-list event, and pending parked frees reconcile in the destructor drain
+    std::string exercise_explicit_pool_dtor_drain(size_t count) {
+        using alloc_t = allocazam::allocazam_std_allocator<int, allocazam::memory_mode::dynamic>;
+        using state_t = alloc_t::state_type;
+
+        auto free_remotely = [](std::vector<int*>& ptrs) {
+            std::thread t{[&] {
+                alloc_t stateless{};
+                std::ranges::for_each(ptrs, [&](int* p) { stateless.deallocate(p, 1); });
+            }};
+            t.join();
+        };
+
+        // recycle: owner exhausts the free list, then the drain feeds it
+        {
+            state_t state{1024, 65536};
+            alloc_t bound{state};
+
+            std::vector<int*> ptrs(count, nullptr);
+            std::ranges::for_each(ptrs, [&](int*& p) { p = bound.allocate(1); });
+            free_remotely(ptrs);
+            require(state.pool.size() == count, "routed frees must park until the owner drains");
+
+            size_t cap = state.pool.capacity();
+            std::vector<int*> refill;
+            refill.reserve(cap - count + 1);
+            std::ranges::for_each(std::views::iota(size_t{0}, cap - count + 1), [&](size_t) {
+                int* p = bound.allocate(1);
+                require(p != nullptr, "recycle allocation failed");
+                refill.push_back(p);
+            });
+            require(state.pool.capacity() == cap, "parked nodes must recycle before growth");
+            std::ranges::for_each(refill, [&](int* p) { bound.deallocate(p, 1); });
+            require(state.pool.size() == 0, "accounting must be exact after drain");
+        }
+
+        // destructor drain: parked frees still pending at destruction reconcile without
+        // a spurious outstanding-objects assert
+        {
+            state_t state{1024, 65536};
+            alloc_t bound{state};
+
+            std::vector<int*> ptrs(count, nullptr);
+            std::ranges::for_each(ptrs, [&](int*& p) { p = bound.allocate(1); });
+            free_remotely(ptrs);
+            require(state.pool.size() == count, "routed frees must park until destruction");
+        }
+
+        return "count=" + std::to_string(count);
+    }
+
+#if !defined(NDEBUG) && defined(__linux__)
+    // test case 5: the canary asserts stay exact on the local path, and the granule
+    // debug tag catches stateless frees of raw pool memory. fork-based: the child must
+    // die on SIGABRT. all sibling test threads are joined by the time this runs
+    template <typename Fn>
+    [[nodiscard]] bool expect_abort(Fn&& fn) {
+        pid_t pid = ::fork();
+        if (pid == 0) {
+            ::close(2);
+            fn();
+            ::_exit(0);
+        }
+        if (pid < 0) {
+            return false;
+        }
+        int status = 0;
+        ::waitpid(pid, &status, 0);
+        return WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT;
+    }
+
+    std::string exercise_debug_assert_semantics() {
+        bool double_free_aborts = expect_abort([] {
+            using state_t = allocazam::allocazam_std_state<int, allocazam::memory_mode::dynamic>;
+            using alloc_t = allocazam::allocazam_std_allocator<int, allocazam::memory_mode::dynamic>;
+            state_t state{64, 65536};
+            alloc_t alloc{state};
+            int* p = alloc.allocate(1);
+            alloc.deallocate(p, 1);
+            alloc.deallocate(p, 1);
+        });
+        require(double_free_aborts, "double free through an explicit pool must trip the canary");
+
+        bool raw_free_aborts = expect_abort([] {
+            allocazam::allocazam<int, allocazam::memory_mode::dynamic> raw_pool{64};
+            int* p = raw_pool.allocate();
+            allocazam::allocazam_std_allocator<int, allocazam::memory_mode::dynamic> stateless{};
+            stateless.deallocate(p, 1);
+        });
+        require(raw_free_aborts, "stateless free of raw pool memory must trip the granule tag assert");
+
+        // remote-path validation lives at drain time: a locally-freed node parked again
+        // on the remote stack must trip the drain's free-list canary (here via the
+        // destructor drain)
+        bool pool_remote_double_free_aborts = expect_abort([] {
+            allocazam::allocazam<int, allocazam::memory_mode::dynamic, true> pool{64};
+            int* p = pool.allocate();
+            pool.deallocate(p);
+            pool.remote_push(p);
+        });
+        require(pool_remote_double_free_aborts, "remote double free must trip the pool drain canary");
+
+        // runner variant: a freed run pushed remotely still carries its free flag when
+        // the find-fit-failure drain replays it
+        bool runner_remote_double_free_aborts = expect_abort([] {
+            allocazam::runner::allocator<true> runs{65536};
+            void* anchor = runs.allocate_bytes(64, 16);
+            void* p = runs.allocate_bytes(256, 16);
+            runs.deallocate_bytes(p);
+            runs.remote_push(p);
+            (void)runs.allocate_bytes(size_t{1} << 20, 16);  // find-fit failure forces the drain
+            (void)anchor;
+        });
+        require(runner_remote_double_free_aborts, "remote double free must trip the runner drain canary");
+
+        return "ok";
+    }
+#else
+    std::string exercise_debug_assert_semantics() {
+        return "skipped (NDEBUG or non-linux)";
+    }
+#endif
+
     std::string exercise_tls_cache_thread_exit_reclaim(size_t thread_count, size_t request_count) {
         using alloc_t = allocazam::allocazam_std_allocator<char, allocazam::memory_mode::fixed>;
         size_t succeeded = 0;
@@ -709,6 +1082,38 @@ int main() {
     add_mode_matrix<allocazam::memory_mode::dynamic>(rows);
     add_mode_matrix<allocazam::memory_mode::fixed>(rows);
     add_mode_matrix<allocazam::memory_mode::noheap>(rows);
+
+    add_case(rows, "granule", "owner_mask_resolution", "int", 600, [] {
+        return exercise_granule_headers<int>(64, 600);
+    });
+    add_case(rows, "granule", "owner_mask_resolution", "obj24", 600, [] {
+        return exercise_granule_headers<obj24>(64, 600);
+    });
+    add_case(rows, "granule", "owner_mask_resolution", "obj4k", 20, [] {
+        return exercise_granule_headers<obj4k>(4, 20);
+    });
+    add_case(rows, "granule", "remote_drain_all_parked", "int", 64, [] {
+        return exercise_pool_remote_drain<allocazam::memory_mode::fixed>(64);
+    });
+    add_case(rows, "granule", "remote_drain_no_grow", "int", 64, [] {
+        return exercise_pool_remote_drain<allocazam::memory_mode::dynamic>(64);
+    });
+
+    add_case(rows, "threaded", "cross_thread_free_drain", "int", 0, [] {
+        return exercise_cross_thread_free_drain<allocazam::memory_mode::dynamic>();
+    });
+    add_case(rows, "threaded", "cross_thread_free_drain_fixed", "int", 0, [] {
+        return exercise_cross_thread_free_drain<allocazam::memory_mode::fixed>();
+    });
+    add_case(rows, "threaded", "orphaned_state_safety", "obj16", 512, [] {
+        return exercise_orphaned_state_safety(512);
+    });
+    add_case(rows, "threaded", "state_semantics", "obj64", 0, [] { return exercise_state_semantics(); });
+    add_case(rows, "threaded", "allocator_equality", "obj64", 0, [] { return exercise_allocator_equality(); });
+    add_case(rows, "threaded", "explicit_pool_dtor_drain", "int", 256, [] {
+        return exercise_explicit_pool_dtor_drain(256);
+    });
+    add_case(rows, "asserts", "debug_assert_semantics", "int", 0, [] { return exercise_debug_assert_semantics(); });
 
     print_table(rows);
 

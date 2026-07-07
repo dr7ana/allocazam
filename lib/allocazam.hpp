@@ -4,6 +4,7 @@
 #include "types.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <span>
 
 namespace allocazam {
@@ -23,10 +24,10 @@ namespace allocazam {
     template <memory_mode Mode>
     concept fixed_like_mode = fixed_mode<Mode> || noheap_mode<Mode>;
 
-    template <typename T, memory_mode Mode = memory_mode::fixed>
+    template <typename T, memory_mode Mode = memory_mode::fixed, bool OwnerHeaders = false>
     class allocazam {
         using node = node_t<T>;
-        using chunk = chunk_t<T, heap_backed_mode<Mode>>;
+        using chunk = chunk_t<T, heap_backed_mode<Mode>, OwnerHeaders>;
 
         static constexpr size_t node_alignment{alignof(node)};
         static constexpr size_t node_size{sizeof(node)};
@@ -51,6 +52,23 @@ namespace allocazam {
             _add_chunk(_next_growth);
         }
 
+        constexpr explicit allocazam(size_t pool_size, lazy_init_t)
+            requires(heap_backed_mode<Mode>)
+                : _page_size{detail::detect_page_size()},
+                  _nodes_per_page{_page_node_capacity(_page_size)},
+                  _alloc_align{_page_alloc_align(_page_size)} {
+            if (!std::has_single_bit(pool_size)) {
+                throw std::invalid_argument{"allocator buffer size must be a power of 2"};
+            }
+
+            if constexpr (dynamic_mode<Mode>) {
+                _chunks.reserve(4);
+            }
+
+            // first chunk deferred to the empty-free-list path in allocate()
+            _next_growth = pool_size;
+        }
+
         constexpr explicit allocazam(std::span<std::byte> backing)
             requires(noheap_mode<Mode>)
         {
@@ -73,25 +91,55 @@ namespace allocazam {
         }
 
         constexpr ~allocazam() {
+            if constexpr (OwnerHeaders) {
+                // destruction is single-threaded by contract; without this drain a pool
+                // that received routed frees would assert spuriously on nodes that were
+                // correctly freed
+                _drain_remote();
+            }
             // compiled out in release mode
             assert(_size == 0 && "outstanding objects at pool destruction");
         }
 
         allocazam(const allocazam&) = delete;
         allocazam& operator=(const allocazam&) = delete;
-        allocazam(allocazam&&) noexcept = default;
-        allocazam& operator=(allocazam&&) noexcept = default;
+        // headered pools are immovable: granule headers hold the pool's address
+        allocazam(allocazam&&) noexcept
+            requires(!OwnerHeaders)
+        = default;
+        allocazam& operator=(allocazam&&) noexcept
+            requires(!OwnerHeaders)
+        = default;
 
         constexpr T* allocate() {
             node* n = _pop_free_node();
             if (n == nullptr) {
-                if constexpr (fixed_like_mode<Mode>) {
-                    return nullptr;
-                } else {
-                    _grow();
-                    n = _pop_free_node();
-                    if (n == nullptr) {
-                        throw std::bad_alloc{};
+                // drain-before-fail is structural: in fixed mode every node may be parked
+                // remotely — exhaustion is not real until the remote stack is drained
+                if constexpr (OwnerHeaders) {
+                    if (_drain_remote()) {
+                        n = _pop_free_node();
+                    }
+                }
+                if (n == nullptr) {
+                    if constexpr (heap_backed_mode<Mode>) {
+                        // lazily-constructed pool: first chunk lands here, on the slow
+                        // path that already exists — zero hot-path branches
+                        if (_capacity == 0 && _next_growth != 0) {
+                            _add_chunk(_next_growth);
+                            n = _pop_free_node();
+                        }
+                    }
+                }
+                if (n == nullptr) {
+                    if constexpr (fixed_like_mode<Mode>) {
+                        return nullptr;
+                    } else {
+                        _grow();
+                        n = _pop_free_node();
+                        if (n == nullptr) {
+                            throw std::bad_alloc{};
+                        }
                     }
                 }
             }
@@ -131,7 +179,28 @@ namespace allocazam {
             --_size;
         }
 
+        // the only thread-safe entry point. parks a node on the remote stack; the owner
+        // splices it back on its next empty-free-list event (or at destruction). may not
+        // touch _size, the free list, or the chunk list — the owner mutates those
+        // concurrently
+        void remote_push(T* ptr) noexcept
+            requires(OwnerHeaders)
+        {
+            assert(ptr != nullptr && "remote_push requires a node pointer");
+            node* n = _node_from_value(ptr);
+            node* head = _remote.head.load(std::memory_order_relaxed);
+            do {
+                std::construct_at(_next_ptr(n), head);
+            } while (
+                    !_remote.head.compare_exchange_weak(head, n, std::memory_order_release, std::memory_order_relaxed));
+        }
+
         [[nodiscard]] static constexpr memory_mode mode() noexcept { return Mode; }
+        [[nodiscard]] static constexpr size_t granule_bytes(size_t page_size) noexcept
+            requires(OwnerHeaders)
+        {
+            return chunk::granule_for(page_size);
+        }
         [[nodiscard]] constexpr size_t size() const noexcept { return _size; }
         [[nodiscard]] constexpr size_t capacity() const noexcept { return _capacity; }
         [[nodiscard]] constexpr size_t free_count() const noexcept { return _capacity - _size; }
@@ -181,6 +250,30 @@ namespace allocazam {
             return n;
         }
 
+        // owner-only. takes over the whole stack in one acquire exchange (no per-node
+        // pops from a shared stack — no ABA) and splices it into the local free list;
+        // the walk touches nodes about to be handed out, doubling as prefetch
+        bool _drain_remote() noexcept
+            requires(OwnerHeaders)
+        {
+            node* n = _remote.head.exchange(nullptr, std::memory_order_acquire);
+            if (n == nullptr) {
+                return false;
+            }
+            while (n != nullptr) {
+                node* next = *std::launder(_next_ptr(n));
+                // the remote path has no free-time canaries (the pusher may not touch
+                // owner state), so drain time is where its validation lives. incremental
+                // pushes mean the free-list check also catches intra-batch duplicates
+                assert(_owns_pointer(_value_ptr(n)) && "remotely freed pointer does not belong to this pool");
+                assert(!_is_in_free_list(_value_ptr(n)) && "remote double free detected");
+                _push_free_node(n);
+                --_size;
+                n = next;
+            }
+            return true;
+        }
+
         constexpr void _add_chunk(size_t slot_count)
             requires(heap_backed_mode<Mode>)
         {
@@ -192,6 +285,10 @@ namespace allocazam {
             } else {
                 _chunks.emplace_back(slot_count, _page_size, _alloc_align);
                 c = &_chunks.back();
+            }
+
+            if constexpr (OwnerHeaders) {
+                c->stamp_owner(this);
             }
 
             std::ranges::for_each(std::views::iota(size_t{0}, c->count), [&](size_t i) { _push_free_node(c->at(i)); });
@@ -224,9 +321,7 @@ namespace allocazam {
 
         constexpr bool _owns_pointer(const T* ptr) const noexcept {
             auto* target_node = _node_from_bytes(reinterpret_cast<const std::byte*>(ptr));
-            return std::ranges::any_of(_chunks, [target_node](const auto& c) {
-                return c.nodes != nullptr && target_node >= c.nodes && target_node < (c.nodes + c.count);
-            });
+            return std::ranges::any_of(_chunks, [target_node](const auto& c) { return c.contains(target_node); });
         }
 
         constexpr bool _is_in_free_list(const T* ptr) const noexcept {
@@ -250,6 +345,15 @@ namespace allocazam {
 
         node* _free_head{nullptr};
         chunk_buffer _chunks{};
+
+        struct remote_stack_t {
+            // isolated: remote pushers hammer this line; the owner's hot fields must not
+            // share it
+            alignas(detail::cache_line_size) std::atomic<node*> head{nullptr};
+        };
+        struct no_remote_stack_t {};
+
+        [[no_unique_address]] std::conditional_t<OwnerHeaders, remote_stack_t, no_remote_stack_t> _remote{};
     };
 
     template <typename T>
@@ -261,25 +365,43 @@ namespace allocazam {
     template <typename T>
     using noheap_allocazam = allocazam<T, memory_mode::noheap>;
 
+    // which resource an allocazam_std_allocator draws from:
+    // - default_state: the process-default state (per-thread post-flip)
+    // - explicit_state: a caller-bound allocazam_std_state, confined semantics
+    // - runs_override: rebound from another allocator; pinned to that allocator's runner
+    enum class resource_mode : uint8_t { default_state, explicit_state, runs_override };
+
     template <typename T, memory_mode Mode = memory_mode::dynamic, huge_pages Huge = huge_pages::disabled>
     struct allocazam_std_state;
 
+    // heap-backed std_state pools are headered: they are the routable targets of
+    // owner-routed deallocation. noheap stays raw — external backing cannot guarantee
+    // granule alignment, and noheap states are explicit-only (unreachable by routing)
     template <typename T, huge_pages Huge>
     struct alignas(detail::cache_line_size) allocazam_std_state<T, memory_mode::fixed, Huge> {
-        allocazam<T, memory_mode::fixed> pool;
+        allocazam<T, memory_mode::fixed, true> pool;
         runner::allocator<false, false, Huge> runs;
+        // intrusive link for the thread-state registry (default-created states only)
+        allocazam_std_state* registry_next{nullptr};
 
         explicit allocazam_std_state(size_t pool_size = 4096)
                 : pool(pool_size), runs(std::ranges::max(pool_size * sizeof(T), size_t{4096})) {}
+
+        explicit allocazam_std_state(lazy_init_t)
+                : pool(4096, lazy_init), runs(std::ranges::max(size_t{4096} * sizeof(T), size_t{4096}), lazy_init) {}
     };
 
     template <typename T, huge_pages Huge>
     struct alignas(detail::cache_line_size) allocazam_std_state<T, memory_mode::dynamic, Huge> {
-        allocazam<T, memory_mode::dynamic> pool;
+        allocazam<T, memory_mode::dynamic, true> pool;
         runner::allocator<true, false, Huge> runs;
+        // intrusive link for the thread-state registry (default-created states only)
+        allocazam_std_state* registry_next{nullptr};
 
         explicit allocazam_std_state(size_t pool_size = 4096, size_t runner_bytes = 65536)
                 : pool(pool_size), runs(runner_bytes) {}
+
+        explicit allocazam_std_state(lazy_init_t) : pool(4096, lazy_init), runs(65536, lazy_init) {}
     };
 
     template <typename T, huge_pages Huge>
@@ -326,22 +448,32 @@ namespace allocazam {
             using other = allocazam_std_allocator<U, Mode, Huge>;
         };
 
-        constexpr allocazam_std_allocator()
+        // stateless: the calling thread's state is resolved per call (created on first
+        // touch). three trivial inits — the throw surface lives on first allocation now
+        constexpr allocazam_std_allocator() noexcept
             requires(heap_backed_mode<Mode> && Huge == huge_pages::disabled)
-                : _state{&_default_state()}, _runs_override{nullptr}, _tls_enabled{true} {}
+                : _state{nullptr}, _runs_override{nullptr}, _mode{resource_mode::default_state} {}
 
         constexpr explicit allocazam_std_allocator(state_type& state) noexcept
-                : _state{&state}, _runs_override{nullptr}, _tls_enabled{false} {}
+                : _state{&state}, _runs_override{nullptr}, _mode{resource_mode::explicit_state} {}
 
+        // rebind, two behaviors: a stateless source propagates statelessness (n==1 lands
+        // in the calling thread's U pool); an explicit source pins its runner — it can
+        // bind neither U's default pool (violates confinement) nor the source's state
+        // (wrong type)
         template <typename U>
         constexpr allocazam_std_allocator(const allocazam_std_allocator<U, Mode, Huge>& other) noexcept
-                : _state{nullptr}, _runs_override{other._runs_ptr()}, _tls_enabled{false} {
-            assert(_runs_override != nullptr && "rebind source allocator must be initialized");
+                : _state{nullptr}, _runs_override{nullptr}, _mode{resource_mode::default_state} {
+            if (other._mode != resource_mode::default_state) {
+                _runs_override = other._runs_ptr();
+                _mode = resource_mode::runs_override;
+                assert(_runs_override != nullptr && "rebind source allocator must be initialized");
+            }
         }
 
         template <typename U>
         constexpr allocazam_std_allocator(const allocazam_std_allocator<U, Mode, Huge>&, state_type& state) noexcept
-                : _state{&state}, _runs_override{nullptr}, _tls_enabled{false} {}
+                : _state{&state}, _runs_override{nullptr}, _mode{resource_mode::explicit_state} {}
 
         [[nodiscard]] T* allocate(size_t n) {
             assert(_has_allocation_resource() && "allocator state must be initialized");
@@ -355,8 +487,9 @@ namespace allocazam {
             }
 
             if (n == 1) [[likely]] {
-                if (_state != nullptr) {
-                    T* p = _state->pool.allocate();
+                state_type* s = _alloc_state();
+                if (s != nullptr) {
+                    T* p = s->pool.allocate();
                     if (p == nullptr) {
                         throw std::bad_alloc{};
                     }
@@ -418,17 +551,17 @@ namespace allocazam {
             assert(_has_allocation_resource() && "allocator state must be initialized");
 
             if (n == 1) [[likely]] {
-                if (_state != nullptr) {
-                    _state->pool.deallocate(p);
+                if (_mode == resource_mode::default_state || _state != nullptr) {
+                    _free_node_routed(p);
                 } else {
-                    _runs().deallocate_bytes(static_cast<void*>(p));
+                    _free_run_routed(static_cast<void*>(p));
                 }
                 return;
             }
 
             size_t bytes = 0;
             if (!detail::checked_mul(n, sizeof(T), bytes)) {
-                _runs().deallocate_bytes(static_cast<void*>(p));
+                _free_run_routed(static_cast<void*>(p));
                 return;
             }
 
@@ -437,7 +570,7 @@ namespace allocazam {
                 return;
             }
 
-            _runs().deallocate_bytes(static_cast<void*>(p));
+            _free_run_routed(static_cast<void*>(p));
         }
 
         [[nodiscard]] size_t expand(T* p, size_t min_new_bytes) noexcept {
@@ -447,6 +580,28 @@ namespace allocazam {
 
             assert(_has_allocation_resource() && "allocator state must be initialized");
 
+            if (_mode == resource_mode::default_state) {
+                // the four-case classifier — sound against byte collisions, race-free at
+                // every step. expansion is an optimization; callers fall back to relocate
+                state_type* local = _local_state_or_null();
+                if (local == nullptr) {
+                    return 0;
+                }
+                if (local->pool.owns(p)) {
+                    return sizeof(T);
+                }
+                auto* local_runs = const_cast<runs_type*>(std::addressof(local->runs));
+                if (runs_type::owner_of(static_cast<void*>(p)) == local_runs &&
+                    local_runs->owns_run(static_cast<const void*>(p))) {
+                    // the local chunk-range check makes a coincidental owner-word
+                    // collision harmless before any header surgery
+                    return local_runs->expand(static_cast<void*>(p), min_new_bytes);
+                }
+                // foreign-owned: current payload is unrepresentable from here by design
+                return 0;
+            }
+
+            // bound allocators keep today's exact behavior
             // n==1 allocate path routes to node pool, not runner; ensure node pool nodes are not expanded
             if (_state != nullptr && _state->pool.owns(p)) {
                 return sizeof(T);
@@ -471,7 +626,24 @@ namespace allocazam {
 
         [[nodiscard]] constexpr size_t max_size() const noexcept { return static_cast<size_t>(-1) / sizeof(T); }
 
-        [[nodiscard]] constexpr state_type* state() const noexcept { return _state; }
+        // the state this allocator would use for its next allocation on the calling
+        // thread — created on first touch for stateless instances; nullptr only for
+        // rebound-from-explicit (no state_type, runs pointer only). not noexcept: first
+        // touch allocates
+        [[nodiscard]] state_type* state() const {
+            if (_mode == resource_mode::default_state) {
+                if constexpr (heap_backed_mode<Mode> && Huge == huge_pages::disabled) {
+                    return &_thread_state();
+                }
+            }
+            return _state;
+        }
+
+        // head of the push-only registry of every default thread state created for this
+        // (T, Mode) instantiation; walk via state->registry_next
+        [[nodiscard]] static state_type* thread_state_registry() noexcept {
+            return _state_registry.load(std::memory_order_acquire);
+        }
 
         friend constexpr bool operator==(
                 const allocazam_std_allocator& lhs, const allocazam_std_allocator& rhs) noexcept {
@@ -509,13 +681,26 @@ namespace allocazam {
         struct tls_run_cache {
             std::array<tls_run_class, tls_run_class_count> classes{};
 
+            // runs at thread exit: locally-owned entries free directly (the TLS pointer
+            // is still valid — it is never nulled and states outlive their thread);
+            // foreign-owned entries route home over their owner's remote stack (a
+            // cross-thread deallocate_bytes would race the owner)
             ~tls_run_cache() {
-                std::ranges::for_each(classes, [](tls_run_class& cls) {
+                runs_type* local = nullptr;
+                if constexpr (heap_backed_mode<Mode> && Huge == huge_pages::disabled) {
+                    state_type* s = _tls_state;
+                    local = s != nullptr ? std::addressof(s->runs) : nullptr;
+                }
+                std::ranges::for_each(classes, [local](tls_run_class& cls) {
                     tls_run_node* node = cls.head;
                     while (node != nullptr) {
                         tls_run_node* next = node->next;
                         if (node->owner != nullptr) {
-                            node->owner->deallocate_bytes(static_cast<void*>(node));
+                            if (node->owner == local) {
+                                node->owner->deallocate_bytes(static_cast<void*>(node));
+                            } else {
+                                node->owner->remote_push(static_cast<void*>(node));
+                            }
                         }
                         node = next;
                     }
@@ -548,24 +733,84 @@ namespace allocazam {
                 if constexpr (sizeof(T) != 1) {
                     return false;
                 }
-                return _tls_enabled && (bytes <= tls_run_cutoff);
+                return _mode == resource_mode::default_state && (bytes <= tls_run_cutoff);
             } else {
                 return false;
             }
         }
 
         [[nodiscard]] constexpr bool _has_allocation_resource() const noexcept {
-            return _state != nullptr || _runs_override != nullptr;
+            switch (_mode) {
+                case resource_mode::default_state:
+                    return true;  // resolved (and created) per call
+                case resource_mode::runs_override:
+                    return _runs_override != nullptr;
+                case resource_mode::explicit_state:
+                    break;
+            }
+            return _state != nullptr;
         }
 
-        [[nodiscard]] runs_type* _runs_ptr() const noexcept {
+        // allocation-context resolution: creates the calling thread's state for the
+        // default mode. deallocation paths must use _local_runs_or_null instead
+        [[nodiscard]] runs_type* _runs_ptr() const {
+            if (_mode == resource_mode::default_state) {
+                if constexpr (heap_backed_mode<Mode> && Huge == huge_pages::disabled) {
+                    return const_cast<runs_type*>(std::addressof(_thread_state().runs));
+                }
+            }
             if (_state != nullptr) {
                 return const_cast<runs_type*>(std::addressof(_state->runs));
             }
             return _runs_override;
         }
 
-        [[nodiscard]] runs_type& _runs() const noexcept {
+        // owner-routed n==1 free. default-state mode resolves the owning pool from the
+        // granule header (pre-flip: always the bound global state, so behavior is
+        // identical); other modes keep their confined direct path
+        void _free_node_routed(T* p) noexcept {
+            if constexpr (heap_backed_mode<Mode>) {
+                if (_mode == resource_mode::default_state) {
+                    using pool_t = allocazam<T, Mode, true>;
+                    size_t granule = pool_t::granule_bytes(detail::detect_page_size());
+                    auto* header =
+                            reinterpret_cast<const granule_header*>(reinterpret_cast<uintptr_t>(p) & ~(granule - 1));
+                    assert(header->debug_tag == granule_debug_tag && "default-path free of non-pool memory");
+                    auto* owner = static_cast<pool_t*>(header->owner);
+                    assert(owner != nullptr && "granule header owner must be stamped");
+                    // null TLS state means "definitely not mine": pure-consumer threads
+                    // never materialize a state to free
+                    state_type* local = _local_state_or_null();
+                    if (local != nullptr && owner == &local->pool) {
+                        local->pool.deallocate(p);
+                    } else {
+                        owner->remote_push(p);
+                    }
+                    return;
+                }
+            }
+            assert(_state != nullptr && "pool-side free requires a bound state");
+            _state->pool.deallocate(p);
+        }
+
+        // owner-routed runner-side free. default-state mode reads the run header's owner
+        // word — the only foreign-readable word — and routes home; other modes keep their
+        // confined direct path
+        void _free_run_routed(void* p) noexcept {
+            if (_mode == resource_mode::default_state) {
+                runs_type* owner = runs_type::owner_of(p);
+                assert(owner != nullptr && "run header owner must be stamped");
+                if (owner == _local_runs_or_null()) {
+                    owner->deallocate_bytes(p);
+                } else {
+                    owner->remote_push(p);
+                }
+                return;
+            }
+            _runs().deallocate_bytes(p);
+        }
+
+        [[nodiscard]] runs_type& _runs() const {
             runs_type* runs = _runs_ptr();
             assert(runs != nullptr && "allocator runs must be initialized");
             return *runs;
@@ -618,7 +863,13 @@ namespace allocazam {
                     break;
                 }
                 assert(node->owner != nullptr && "tls cache node owner must not be null");
-                node->owner->deallocate_bytes(static_cast<void*>(node));
+                // foreign-stamped entries ride in the cache until drain; only the local
+                // runner may be mutated from this thread
+                if (node->owner == _local_runs_or_null()) {
+                    node->owner->deallocate_bytes(static_cast<void*>(node));
+                } else {
+                    node->owner->remote_push(static_cast<void*>(node));
+                }
             }
         }
 
@@ -665,19 +916,70 @@ namespace allocazam {
             if (thread_local_cache().classes[idx].count >= tls_high_watermark) {
                 _tls_drain_class(idx, tls_drain_low_watermark);
             }
-            _tls_push(idx, static_cast<void*>(p), _runs_ptr());
+            // stamp from the run header's owner word, not from this allocator's runner:
+            // a stateless allocator may be freeing a buffer another thread's runner owns
+            // (identical value pre-flip)
+            _tls_push(idx, static_cast<void*>(p), runs_type::owner_of(static_cast<void*>(p)));
         }
 
-        static state_type& _default_state()
+        // constant-initialized, trivially-destructible: a plain TLS load plus null branch
+        // on the hot path, no init guard, and no TLS destruction-order hazard — the
+        // pointer is never nulled and v1 never destroys states, so allocations during
+        // other thread_local destructors (including the TLS run cache's own) stay safe
+        constinit static inline thread_local state_type* _tls_state{nullptr};
+
+        // process registry of every thread state ever created: reachability (LSan),
+        // test introspection, and the v2 reclamation worklist. push-only Treiber list
+        constinit static inline std::atomic<state_type*> _state_registry{nullptr};
+
+        static state_type& _thread_state()
             requires(heap_backed_mode<Mode> && Huge == huge_pages::disabled)
         {
-            static state_type* state = new state_type{};
-            return *state;
+            state_type* slot = _tls_state;
+            if (slot == nullptr) [[unlikely]] {
+                auto* fresh = new state_type{lazy_init};
+                state_type* head = _state_registry.load(std::memory_order_relaxed);
+                do {
+                    fresh->registry_next = head;
+                } while (!_state_registry.compare_exchange_weak(
+                        head, fresh, std::memory_order_release, std::memory_order_relaxed));
+                _tls_state = fresh;
+                slot = fresh;
+            }
+            return *slot;
+        }
+
+        // the state this allocator's next allocation on this thread would draw from —
+        // creating it if the mode says so — or null. never creates for deallocation
+        // callers; those use the *_or_null peers
+        [[nodiscard]] state_type* _alloc_state() const {
+            if (_mode == resource_mode::default_state) {
+                if constexpr (heap_backed_mode<Mode> && Huge == huge_pages::disabled) {
+                    return &_thread_state();
+                }
+            }
+            return _state;
+        }
+
+        [[nodiscard]] static state_type* _local_state_or_null() noexcept {
+            if constexpr (heap_backed_mode<Mode> && Huge == huge_pages::disabled) {
+                return _tls_state;
+            } else {
+                return nullptr;
+            }
+        }
+
+        [[nodiscard]] runs_type* _local_runs_or_null() const noexcept {
+            if (_mode == resource_mode::default_state) {
+                state_type* local = _local_state_or_null();
+                return local != nullptr ? std::addressof(local->runs) : nullptr;
+            }
+            return _runs_ptr();
         }
 
         state_type* _state{nullptr};
         runs_type* _runs_override{nullptr};
-        bool _tls_enabled{false};
+        resource_mode _mode{resource_mode::explicit_state};
     };
 
 }  // namespace allocazam

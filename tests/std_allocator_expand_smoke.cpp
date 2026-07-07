@@ -11,6 +11,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
 
 namespace {
 #if defined(__linux__)
@@ -199,6 +200,60 @@ namespace {
         alloc.deallocate(p, 1);
     }
 
+    // the four stateless-classifier cases, in order: null TLS state -> 0 (and no state
+    // materializes); local pool node -> sizeof(T); local runner run -> expands;
+    // foreign-owned run -> 0 with the foreign runner untouched
+    void test_expand_stateless_classifier() {
+        using alloc_t = allocazam::allocazam_std_allocator<int, allocazam::memory_mode::dynamic>;
+        using state_t = alloc_t::state_type;
+
+        auto registry_count = [] {
+            size_t n = 0;
+            for (state_t* s = alloc_t::thread_state_registry(); s != nullptr; s = s->registry_next) {
+                ++n;
+            }
+            return n;
+        };
+
+        alloc_t main_alloc{};
+
+        int* buf = main_alloc.allocate(64);
+        require(buf != nullptr, "runner allocation failed");
+        size_t payload = main_alloc.expand(buf, 64 * sizeof(int));
+        require(payload >= 64 * sizeof(int), "local runner expand must report at least the current payload");
+
+        int* node = main_alloc.allocate(1);
+        require(node != nullptr, "pool allocation failed");
+        require(main_alloc.expand(node, sizeof(int) * 4) == sizeof(int),
+                "local pool node must report single-object payload");
+
+        size_t registry_before = registry_count();
+        size_t foreign_no_state = 1;
+        std::thread consumer{[&] {
+            alloc_t worker_alloc{};
+            foreign_no_state = worker_alloc.expand(buf, 16);
+        }};
+        consumer.join();
+        require(foreign_no_state == 0, "null-TLS-state expand must return 0");
+        require(registry_count() == registry_before, "expand must never create a thread state");
+
+        buf[0] = 1234;
+        size_t foreign_with_state = 1;
+        std::thread holder{[&] {
+            alloc_t worker_alloc{};
+            int* own = worker_alloc.allocate(4);
+            require(own != nullptr, "worker allocation failed");
+            foreign_with_state = worker_alloc.expand(buf, 16);
+            worker_alloc.deallocate(own, 4);
+        }};
+        holder.join();
+        require(foreign_with_state == 0, "foreign-owned run expand must return 0");
+        require(buf[0] == 1234, "foreign expand must not touch the run");
+
+        main_alloc.deallocate(node, 1);
+        main_alloc.deallocate(buf, 64);
+    }
+
     void test_expand_null_returns_zero() {
         using alloc_t = allocazam::allocazam_std_allocator<char, allocazam::memory_mode::dynamic>;
         alloc_t alloc{};
@@ -259,6 +314,7 @@ int main() {
 #endif
             test_case{"std_expand_run_backed", test_expand_run_backed_preserves_pointer_and_payload},
             test_case{"std_expand_pool_pointer", test_expand_pool_pointer_graceful_failure},
+            test_case{"std_expand_stateless_classifier", test_expand_stateless_classifier},
             test_case{"std_expand_null", test_expand_null_returns_zero},
     };
 

@@ -15,3 +15,8 @@ set_target_properties(
     allocazam_std_allocator_expand_smoke
     PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests
 )
+
+add_executable(allocazam_concurrent_stress concurrent_stress.cpp)
+target_link_libraries(allocazam_concurrent_stress PUBLIC liballocazam)
+target_include_directories(allocazam_concurrent_stress PRIVATE ${PROJECT_SOURCE_DIR}/bench)
+set_target_properties(allocazam_concurrent_stress PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)

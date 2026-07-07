@@ -2,6 +2,8 @@
 
 #include "types.hpp"
 
+#include <atomic>
+#include <cstring>
 #include <expected>
 #include <limits>
 #include <span>
@@ -25,8 +27,14 @@ namespace allocazam { namespace runner {
         static_assert(Huge == huge_pages::disabled, "explicit hugetlb runner support requires Linux");
 #endif
 
+        // two-word header, payload at +16. the words have different visibility:
+        // - owner: written at allocation, immutable while the run is allocated; the only
+        //   word a foreign thread may read (at payload-8)
+        // - size_and_flags: owner-private — the owner flips flag bits on allocated
+        //   neighbors (_set_prev_free), so any foreign read of it is a data race
         struct run_header {
             size_t size_and_flags;
+            allocator* owner;
         };
 
         struct free_links {
@@ -61,10 +69,14 @@ namespace allocazam { namespace runner {
         static constexpr size_t bin_count{linear_bin_count + log_bin_count};
         static constexpr size_t bin_word_bits{std::numeric_limits<size_t>::digits};
         static constexpr size_t bin_word_count{(bin_count + bin_word_bits - 1) / bin_word_bits};
-        static constexpr size_t min_free_run_size{sizeof(run_header) + sizeof(free_links) + sizeof(size_t)};
+        static constexpr size_t min_free_run_size{
+                (sizeof(run_header) + sizeof(free_links) + sizeof(size_t) + run_alignment - 1) & ~(run_alignment - 1)};
         static constexpr size_t split_remainder_threshold{64};
         static constexpr size_t epilogue_size{sizeof(run_header)};
         static constexpr size_t min_chunk_bytes{min_free_run_size + epilogue_size};
+
+        static_assert(sizeof(run_header) % run_alignment == 0, "payload offset must preserve run alignment");
+        static_assert(min_free_run_size % run_alignment == 0, "min run size must preserve run alignment");
 
         static constexpr size_t flag_is_free{size_t{1}};
         static constexpr size_t flag_prev_is_free{size_t{2}};
@@ -95,6 +107,13 @@ namespace allocazam { namespace runner {
         explicit allocator(size_t initial_bytes = 65536)
                 : _page_size{detail::detect_page_size()}, _next_growth{std::ranges::max(initial_bytes, size_t{65536})} {
             _next_growth = _add_owned_chunk(initial_bytes);
+        }
+
+        explicit allocator(size_t initial_bytes, lazy_init_t)
+                : _page_size{detail::detect_page_size()},
+                  _next_growth{std::ranges::max(initial_bytes, size_t{65536})},
+                  _deferred_bytes{std::ranges::max(initial_bytes, size_t{1})} {
+            // first chunk deferred to the find-fit-failure path in allocate_bytes()
         }
 
         explicit allocator(std::span<std::byte> backing) : _page_size{detail::detect_page_size()}, _next_growth{0} {
@@ -138,6 +157,18 @@ namespace allocazam { namespace runner {
             size_t scan_count = 0;
             run_header* h = _find_fit(needed, scan_count);
             if (h == nullptr) {
+                if (_drain_remote()) {
+                    h = _find_fit(needed, scan_count);
+                }
+            }
+            if (h == nullptr && _deferred_bytes != 0) {
+                // lazily-constructed runner: first chunk lands here, on the failure
+                // path that already exists — mirrors the eager constructor exactly
+                _next_growth = _add_owned_chunk(_deferred_bytes);
+                _deferred_bytes = 0;
+                h = _find_fit(needed, scan_count);
+            }
+            if (h == nullptr) {
                 if constexpr (can_grow) {
                     _grow_for(needed);
                     h = _find_fit(needed, scan_count);
@@ -153,6 +184,44 @@ namespace allocazam { namespace runner {
                 _stats.granted_bytes += granted;
             }
             return out;
+        }
+
+        // the only thread-safe entry point. parks an allocated payload on the remote
+        // stack; the owner replays it through deallocate_bytes at its next find-fit
+        // failure. the intrusive next pointer lives in payload word 0 — the owner word
+        // at payload-8 stays readable while the run is parked
+        void remote_push(void* p) noexcept {
+            assert(p != nullptr && "remote_push requires a payload pointer");
+            auto* slot = static_cast<void**>(p);
+            void* head = _remote_head.load(std::memory_order_relaxed);
+            do {
+                *slot = head;
+            } while (
+                    !_remote_head.compare_exchange_weak(head, p, std::memory_order_release, std::memory_order_relaxed));
+        }
+
+        // foreign-readable by design: owner is written at allocation and immutable while
+        // the run is allocated; publication rides the synchronization that handed the
+        // payload pointer across threads. never read size_and_flags from a foreign thread.
+        // relaxed atomic load: when the classifier probes a pointer that is NOT a run
+        // payload, these bytes may be foreign live data — the probe must not be a data
+        // race, and the value is only compared, then validated against local chunk ranges
+        [[nodiscard]] static allocator* owner_of(void* payload) noexcept {
+            auto* slot = reinterpret_cast<allocator**>(static_cast<std::byte*>(payload) - sizeof(allocator*));
+            return std::atomic_ref<allocator*>{*slot}.load(std::memory_order_relaxed);
+        }
+
+        [[nodiscard]] bool owns_run(const void* p) const noexcept {
+            if (p == nullptr) {
+                return false;
+            }
+            const auto* b = static_cast<const std::byte*>(p);
+            for (const chunk_node* c = _chunks_head; c != nullptr; c = c->next) {
+                if (b >= c->begin && b < (c->begin + c->bytes)) {
+                    return true;
+                }
+            }
+            return false;
         }
 
         [[nodiscard]] size_t expand(void* p, size_t min_new_bytes) noexcept {
@@ -210,6 +279,8 @@ namespace allocazam { namespace runner {
                     _set_prev_free(next_after_current, false);
                 }
             }
+
+            current->owner = this;
 
             size_t expanded_payload = _run_size(current) - sizeof(run_header);
             if constexpr (collect_stats) {
@@ -584,6 +655,8 @@ namespace allocazam { namespace runner {
                 }
             }
 
+            h->owner = this;
+
             if constexpr (collect_stats) {
                 size_t payload = _run_size(h) - sizeof(run_header);
                 _stats.live_bytes += payload;
@@ -593,6 +666,29 @@ namespace allocazam { namespace runner {
             }
 
             return static_cast<void*>(_payload_from_header(h));
+        }
+
+        // owner-only. takes over the whole stack in one acquire exchange (no per-node
+        // pops from a shared stack — no ABA), then replays each entry through
+        // deallocate_bytes so coalescing and all header/bin mutation stays owner-side.
+        // parked runs are never marked free, so neighbors cannot coalesce into them
+        // before replay. returns true if anything was reclaimed
+        bool _drain_remote() noexcept {
+            void* head = _remote_head.exchange(nullptr, std::memory_order_acquire);
+            if (head == nullptr) {
+                return false;
+            }
+            while (head != nullptr) {
+                void* next = *static_cast<void**>(head);
+                // remote_push only writes the payload word, so the header's free flag is
+                // still owner-readable here: a run that is already free was double-freed
+                // through the remote route (best-effort — a coalesced-away header can't
+                // be checked)
+                assert(!_is_free(_header_from_payload(head)) && "remote double free detected");
+                deallocate_bytes(head);
+                head = next;
+            }
+            return true;
         }
 
         void _grow_for(size_t needed)
@@ -625,6 +721,7 @@ namespace allocazam { namespace runner {
 
             auto* epilogue = reinterpret_cast<run_header*>(c->begin + run_bytes);
             _set_header(epilogue, 0, false, true);
+            epilogue->owner = nullptr;
         }
 
         [[nodiscard]] size_t _add_owned_chunk(size_t bytes) {
@@ -690,6 +787,10 @@ namespace allocazam { namespace runner {
         chunk_node _external_chunk{};
         size_t _page_size{4096};
         size_t _next_growth{65536};
+        size_t _deferred_bytes{0};
         stats_t _stats{};
+
+        // isolated: remote pushers hammer this line; the owner's hot fields must not share it
+        alignas(detail::cache_line_size) std::atomic<void*> _remote_head{nullptr};
     };
 }}  // namespace allocazam::runner

@@ -15,7 +15,8 @@
 
 namespace {
     constexpr size_t run_alignment = alignof(std::max_align_t);
-    constexpr size_t run_header_bytes = sizeof(size_t);
+    // mirrors runner run_header: [size_and_flags][owner], payload at +16
+    constexpr size_t run_header_bytes = sizeof(size_t) + sizeof(void*);
     constexpr size_t huge_page_bytes = size_t{2} << 20;
 
     using fixed_runs = allocazam::runner::allocator<false>;
@@ -157,6 +158,69 @@ namespace {
         return std::nullopt;
     }
 #endif
+
+    void test_remote_push_drain_recycles() {
+        fixed_runs runs(4096);
+
+        void* a = runs.allocate_bytes(1024, run_alignment);
+        require(a != nullptr, "initial allocation failed");
+
+        std::array<void*, 8> fillers{};
+        size_t filler_count = 0;
+        while (filler_count < fillers.size()) {
+            void* f = runs.allocate_bytes(1024, run_alignment);
+            if (f == nullptr) {
+                break;
+            }
+            fillers[filler_count++] = f;
+        }
+        require(filler_count > 0, "expected at least one filler allocation");
+        require(runs.allocate_bytes(1024, run_alignment) == nullptr, "fixed runner should be exhausted");
+
+        runs.remote_push(a);
+        void* recycled = runs.allocate_bytes(1024, run_alignment);
+        require(recycled != nullptr, "drain must satisfy allocation after remote_push in fixed mode");
+
+        runs.deallocate_bytes(recycled);
+        for (size_t i : std::views::iota(size_t{0}, filler_count)) {
+            runs.deallocate_bytes(fillers[i]);
+        }
+    }
+
+    void test_remote_drain_before_grow() {
+        allocazam::runner::allocator<true, true> runs(65536);
+
+        void* a = runs.allocate_bytes(60000, run_alignment);
+        require(a != nullptr, "initial allocation failed");
+        require(runs.stats().grow_calls == 0, "initial allocation must not grow");
+
+        runs.remote_push(a);
+        void* recycled = runs.allocate_bytes(60000, run_alignment);
+        require(recycled != nullptr, "allocation after remote_push failed");
+        require(runs.stats().grow_calls == 0, "drain must satisfy allocation before growing");
+
+        runs.deallocate_bytes(recycled);
+    }
+
+    void test_owns_run_query() {
+        fixed_runs runs(4096);
+        fixed_runs other(4096);
+
+        void* p = runs.allocate_bytes(128, run_alignment);
+        void* q = other.allocate_bytes(128, run_alignment);
+        require(p != nullptr && q != nullptr, "setup allocations failed");
+
+        require(runs.owns_run(p), "owner must recognize its own run");
+        require(!runs.owns_run(q), "owner must not recognize a foreign run");
+        require(!other.owns_run(p), "foreign runner must not recognize this run");
+        require(!runs.owns_run(nullptr), "owns_run(nullptr) must be false");
+
+        int local = 0;
+        require(!runs.owns_run(&local), "owns_run must reject non-arena pointers");
+
+        runs.deallocate_bytes(p);
+        other.deallocate_bytes(q);
+    }
 
     void test_expand_null_and_noop() {
         fixed_runs runs(4096);
@@ -441,6 +505,9 @@ int main() {
 #if defined(__linux__)
             test_case{"hugetlb_runner_mapping_expand", test_hugetlb_runner_mapping_and_expand},
 #endif
+            test_case{"remote_push_drain_recycles", test_remote_push_drain_recycles},
+            test_case{"remote_drain_before_grow", test_remote_drain_before_grow},
+            test_case{"owns_run_query", test_owns_run_query},
             test_case{"expand_null_and_noop", test_expand_null_and_noop},
             test_case{"expand_fail_next_allocated", test_expand_fails_when_next_run_is_allocated},
             test_case{"expand_split_remainder", test_expand_success_with_split_remainder},

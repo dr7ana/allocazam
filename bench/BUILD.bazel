@@ -32,6 +32,24 @@ cc_binary(
 )
 
 cc_binary(
+    name = "cross_thread_free_benchmark",
+    srcs = ["cross_thread_free_benchmark.cpp"],
+    deps = [":std_allocator_bench_common"],
+)
+
+cc_binary(
+    name = "node_pool_std_allocator_benchmark",
+    srcs = ["node_pool_std_allocator_benchmark.cpp"],
+    deps = [":std_allocator_bench_common"],
+)
+
+cc_binary(
+    name = "threaded_default_state_benchmark",
+    srcs = ["threaded_default_state_benchmark.cpp"],
+    deps = [":std_allocator_bench_common"],
+)
+
+cc_binary(
     name = "runner_benchmark",
     srcs = ["runner_benchmark.cpp"],
     deps = ["//:liballocazam"],

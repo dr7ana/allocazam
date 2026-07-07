@@ -87,6 +87,7 @@ jobs:
           ./tests/allocazam_std_allocator_smoke
           ./tests/allocazam_runner_expand_smoke
           ./tests/allocazam_std_allocator_expand_smoke
+          ./tests/allocazam_concurrent_stress
         working-directory: ./build_dbg
 
       - name: Build Release
@@ -98,4 +99,53 @@ jobs:
           ./tests/allocazam_std_allocator_smoke
           ./tests/allocazam_runner_expand_smoke
           ./tests/allocazam_std_allocator_expand_smoke
+          ./tests/allocazam_concurrent_stress
         working-directory: ./build_rel
+
+  tsan:
+    name: tsan (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    env:
+      CC: clang-22
+      CXX: clang++-22
+      TSAN_OPTIONS: halt_on_error=1
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install LLVM (Linux)
+        run: |
+          wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 22 all
+          sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-22 100
+          sudo update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-22 100
+
+      - name: Enable 2MiB Huge Pages
+        run: |
+          echo 128 | sudo tee /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
+
+      - name: Configure
+        run: |
+          cmake -B build_tsan -G "Unix Makefiles" \
+            -DCMAKE_C_COMPILER=clang-22 \
+            -DCMAKE_CXX_COMPILER=clang++-22 \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DALLOCAZAM_SANITIZER=thread
+
+      - name: Build
+        run: make -j
+        working-directory: ./build_tsan
+
+      - name: Test
+        run: |
+          ./tests/allocazam_std_allocator_smoke
+          ./tests/allocazam_runner_expand_smoke
+          ./tests/allocazam_std_allocator_expand_smoke
+          ./tests/allocazam_concurrent_stress
+        working-directory: ./build_tsan
