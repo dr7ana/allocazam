@@ -2,98 +2,177 @@
 
 [![CI](https://github.com/dr7ana/allocazam/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/dr7ana/allocazam/actions/workflows/ci.yml)
 
-`allocazam` is a C++23 hybrid freelist allocator with size-segregated bins, optimized for predictable, deterministic low-latency allocation.
+`allocazam` is a C++23 allocator library for bounded, low-latency storage. Its standard-allocator interface separates two compile-time decisions:
 
-This repository is under active development (read: "I'm tinkering"); internals and APIs may continue to change (read: "break").
+- `memory_mode` selects where backing memory comes from and whether it can grow.
+- `allocation_model` selects how that backing is divided among live allocations.
 
-## Architecture Overview
+The repository is under active development; internals and APIs may change freely.
 
-The implementation is split into three core layers:
+## Configuration
 
-- `lib/allocazam.hpp`: primary allocator template `allocazam<T, Mode>`
-- `lib/types.hpp`: low-level storage primitives (`node_t`, `chunk_t`) and alignment utilities
-- `lib/runner.hpp`: contiguous run allocator used for multi-element allocation paths
+Memory modes:
 
-## Memory Modes
+- `memory_mode::fixed`: Allocazam owns eagerly acquired, non-growing backing.
+- `memory_mode::dynamic`: Allocazam owns backing and may add chunks.
+- `memory_mode::noheap`: the caller supplies backing and Allocazam never owns or releases it.
 
-`memory_mode` currently has three modes:
+Allocation models:
 
-- `fixed`: single heap-backed chunk, no growth after construction
-- `dynamic`: heap-backed chunks with growth when capacity is exhausted
-- `noheap`: caller-provided backing span, no allocator-owned heap allocation in pool paths
+- `allocation_model::suballocated`: the existing node-pool and runner design supports multiple simultaneous allocations.
+- `allocation_model::exclusive`: one contiguous region supports exactly one live nonzero allocation at a time and is reusable after release.
 
-Mode selection is a template argument, and mode-specific behavior is constrained at compile time with concepts and `requires`.
+Supported combinations:
 
-## Huge Pages
+| Memory mode | `suballocated` | `exclusive` |
+| --- | --- | --- |
+| `fixed` | yes | yes |
+| `dynamic` | yes | no |
+| `noheap` | yes | yes |
 
-Contiguous run allocation can also be configured at compile time with `huge_pages`:
+The standard state and allocator template order is:
 
-- `huge_pages::disabled`: default behavior
-- `huge_pages::enabled`: explicit Linux hugetlb mappings for allocator-owned runner chunks
+```cpp
+allocazam_std_state<T, Memory, Allocation, Huge>
+allocazam_std_allocator<T, Memory, Allocation, Huge>
+```
 
-Current scope:
+`Allocation` defaults to `suballocated` and `Huge` defaults to `disabled`. `noheap` supports only `huge_pages::disabled`; page provenance for caller memory is deliberately outside Allocazam policy.
 
-- `huge_pages` is a template parameter on `allocazam::runner::allocator`, `allocazam_std_state`, and `allocazam_std_allocator`
-- `enabled` currently means explicit `2 MiB` huge pages via `MAP_HUGETLB | MAP_HUGE_2MB`
-- there is no fallback path; if hugetlb is enabled and the system is not configured for it, allocation fails
-- this only affects runner-owned contiguous allocations; the single-object node pool path remains normal-page-backed
-- caller-provided external backing spans are unchanged
+## Exclusive allocation
 
-For std-allocator integration, hugetlb-enabled allocators must be constructed from explicit state:
+Exclusive allocation is intended for a vector-like buffer, bounded ring, frame table, scratch region, or another object that needs one stable contiguous allocation. It has constant-time claim/release bookkeeping, stores no metadata in payload bytes, and contains no pool, runner, bin, scan, TLS state, registry, owner routing, lock, or atomic.
+
+The state owns or borrows the byte region. The allocator is a non-owning, one-pointer handle bound explicitly to that state:
 
 ```cpp
 using state_t = allocazam::allocazam_std_state<
-        int,
-        allocazam::memory_mode::dynamic,
-        allocazam::huge_pages::enabled>;
+        record,
+        allocazam::memory_mode::fixed,
+        allocazam::allocation_model::exclusive>;
 
-using alloc_t = allocazam::allocazam_std_allocator<
-        int,
-        allocazam::memory_mode::dynamic,
-        allocazam::huge_pages::enabled>;
+using allocator_t = allocazam::allocazam_std_allocator<
+        record,
+        allocazam::memory_mode::fixed,
+        allocazam::allocation_model::exclusive>;
 
-state_t state{4096, 2u << 20};
-alloc_t alloc{state};
+state_t state{1024}; // element capacity
+allocator_t allocator{state};
 ```
 
-The default-constructed std allocator remains available only for `huge_pages::disabled`.
+Exclusive allocators have no default constructor. States are non-copyable and non-movable so allocator resource pointers remain stable. Allocator handles themselves are copyable and movable; copying or moving a handle preserves resource identity and does not clone or own the state.
 
-## Pool Layer (`allocazam`)
+### Standard containers: reserve first
 
-At the pool level, allocation of individual objects is node-based:
+A standard container normally performs no allocation in its constructor. Its first growth may request only one element, which would claim the exclusive region for that exact allocation and prevent replacement growth.
 
-- free nodes are tracked with an intrusive free list
-- object storage is reused in-place
-- construction/destruction are separated from raw slot acquisition/release
-- growth is mode-dependent (`dynamic` can add chunks, fixed-like modes cannot)
+Portable vector usage reserves the complete intended capacity before inserting anything:
 
-The allocator also exposes allocator-traits compatibility hooks (`rebind`, equality operators, `allocate_at_least` support path) to integrate with standard containers.
+```cpp
+using vector_t = std::vector<record, allocator_t>;
 
-## Node and Chunk Layer (`types.hpp`)
+vector_t records{allocator};
+records.reserve(state.capacity());
 
-- `node_t<T>` defines raw storage sized/aligned for either `T` or free-list linkage metadata
-- `chunk_t<T, owns_memory>` represents contiguous node regions
-- ownership is encoded at compile time (`owns_memory`), so external buffers and owned buffers share one structural model
+for (size_t i = 0; i < state.capacity(); ++i) {
+    records.emplace_back(/* ... */);
+}
+```
 
-This keeps steady-state node operations simple while preserving mode-specific ownership semantics.
+Do not depend on a standard library calling `allocate_at_least()`. The explicit full-capacity `reserve()` is the contract.
 
-## Runner Allocation Layer (`runner.hpp`)
+Containers that require simultaneous allocations, including node containers and ordinary unordered containers, are not compatible with one exclusive resource. Use `suballocated` for them. A vector can be moved while its state remains alive. Ordinary nonempty copy construction selects the same occupied resource and therefore fails; allocator-extended copy construction into a distinct state is the supported copy path. Exception guarantees for a failed container replacement are determined by that standard-library implementation.
 
-For larger contiguous requests (`n > 1` style paths), run allocation is handled by `allocazam::runner::allocator`:
+### Direct bounded storage
 
-- run headers encode size and coalescing flags
-- free runs are bucketed (linear lower bins + logarithmic upper bins)
-- non-empty bins are tracked with bitmasks for fast candidate lookup
-- splitting/coalescing maintains reuse and limits external fragmentation
-- allocator-owned runner chunks can optionally be backed by explicit `2 MiB` hugetlb mappings
+A ring or other direct consumer can claim its whole region without container growth behavior:
 
-This layer is designed for contiguous region management, complementing the single-node free-list path in `allocazam`.
+```cpp
+record* storage = allocator.allocate(state.capacity());
+// Construct, use, and destroy live records as needed.
+allocator.deallocate(storage, state.capacity());
+```
 
-## Design Intent
+Only one nonzero claim may be live. A second claim throws `std::bad_alloc`. Once the first claim is released, the same backing is immediately reusable. `allocate_at_least(n)` reports the full representable capacity and accepts any standard-permitted deallocation count from `n` through the returned count.
 
-The current design targets:
+Exclusive state and backing access is externally serialized. A claim may be handed between threads through normal synchronization, but concurrent operations on one state are not supported.
 
-- explicit behavior by mode
-- predictable allocation failure semantics in bounded modes
-- low metadata overhead in hot paths
-- composable internals that can evolve independently as performance work continues
+### Noheap exclusive
+
+Noheap state aligns forward inside the supplied span, truncates the tail to complete elements, and acquires no memory:
+
+```cpp
+alignas(std::max_align_t) std::array<std::byte, 64 * sizeof(record)> backing{};
+
+using state_t = allocazam::allocazam_std_state<
+        record,
+        allocazam::memory_mode::noheap,
+        allocazam::allocation_model::exclusive>;
+using allocator_t = allocazam::allocazam_std_allocator<
+        record,
+        allocazam::memory_mode::noheap,
+        allocazam::allocation_model::exclusive>;
+
+state_t state{std::span<std::byte>{backing}};
+allocator_t allocator{state};
+
+std::vector<record, allocator_t> records{allocator};
+records.reserve(state.capacity());
+```
+
+The caller-provided backing must outlive the state, every bound allocator, and every live allocation. Allocazam neither frees nor initializes the span. Passing a subspan is the way to impose a smaller capacity.
+
+This mode provides groundwork for embedded deployments where storage may come from static arrays, linker regions, shared memory, device-specific RAM, or another externally managed arena. Allocazam does not infer that memory's provenance or add exception-free platform policy.
+
+## Suballocated allocation
+
+`suballocated` supports general standard-container allocation patterns:
+
+- single-object allocations use an intrusive node pool;
+- multi-element contiguous allocations use the runner;
+- fixed mode fails when its pool/runner backing is exhausted;
+- dynamic mode can grow;
+- noheap mode divides caller backing between a node pool and runner;
+- default heap-backed allocators use per-thread states and owner-routed cross-thread release;
+- explicit states retain confined, caller-managed semantics.
+
+The raw pool API remains independent of `allocation_model`:
+
+```cpp
+allocazam::allocazam<record, allocazam::memory_mode::fixed> pool{4096};
+```
+
+## Huge pages
+
+`huge_pages::enabled` means explicit Linux 2 MiB hugetlb mappings using `MAP_HUGETLB | MAP_HUGE_2MB`. There is no ordinary-page fallback.
+
+For `suballocated`, huge pages back allocator-owned runner chunks; the node pool remains ordinary-page-backed. For `fixed + exclusive`, huge pages back the single owned region. Logical capacity remains the requested usable byte count, while `mapping_bytes()` reports the actual smallest containing 2 MiB multiple.
+
+```cpp
+using state_t = allocazam::allocazam_std_state<
+        char,
+        allocazam::memory_mode::fixed,
+        allocazam::allocation_model::exclusive,
+        allocazam::huge_pages::enabled>;
+
+using allocator_t = allocazam::allocazam_std_allocator<
+        char,
+        allocazam::memory_mode::fixed,
+        allocazam::allocation_model::exclusive,
+        allocazam::huge_pages::enabled>;
+
+state_t state{2u << 20};
+allocator_t allocator{state};
+```
+
+An exact 2 MiB exclusive request maps exactly 2 MiB. A request one byte larger maps 4 MiB but exposes only the requested logical capacity. Mapping or alignment failure throws `std::bad_alloc`.
+
+## Implementation layers
+
+- `lib/allocazam.hpp`: raw pool plus standard state/allocator specializations.
+- `lib/exclusive_resource.hpp`: non-owning exclusive claim ledger.
+- `lib/owned_memory.hpp`: shared ordinary/hugetlb backing acquisition.
+- `lib/runner.hpp`: size-segregated contiguous run allocator for `suballocated`.
+- `lib/types.hpp`: storage primitives, modes, policies, and checked arithmetic.
+
+The runner keeps boundary metadata, linear/logarithmic bins, bitmask lookup, splitting, coalescing, expansion, and owner routing. Exclusive allocation intentionally bypasses that machinery when a consumer needs only one stable region.

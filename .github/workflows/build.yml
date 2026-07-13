@@ -88,6 +88,9 @@ jobs:
           ./tests/allocazam_runner_expand_smoke
           ./tests/allocazam_std_allocator_expand_smoke
           ./tests/allocazam_concurrent_stress
+          ./tests/allocazam_owned_memory_smoke
+          ./tests/allocazam_exclusive_resource_smoke
+          ./tests/allocazam_exclusive_allocator_smoke
         working-directory: ./build_dbg
 
       - name: Build Release
@@ -100,6 +103,9 @@ jobs:
           ./tests/allocazam_runner_expand_smoke
           ./tests/allocazam_std_allocator_expand_smoke
           ./tests/allocazam_concurrent_stress
+          ./tests/allocazam_owned_memory_smoke
+          ./tests/allocazam_exclusive_resource_smoke
+          ./tests/allocazam_exclusive_allocator_smoke
         working-directory: ./build_rel
 
   tsan:
@@ -148,4 +154,7 @@ jobs:
           ./tests/allocazam_runner_expand_smoke
           ./tests/allocazam_std_allocator_expand_smoke
           ./tests/allocazam_concurrent_stress
+          ./tests/allocazam_owned_memory_smoke
+          ./tests/allocazam_exclusive_resource_smoke
+          ./tests/allocazam_exclusive_allocator_smoke
         working-directory: ./build_tsan

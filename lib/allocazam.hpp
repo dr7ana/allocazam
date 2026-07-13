@@ -1,5 +1,7 @@
 #pragma once
 
+#include "exclusive_resource.hpp"
+#include "owned_memory.hpp"
 #include "runner.hpp"
 #include "types.hpp"
 
@@ -23,6 +25,19 @@ namespace allocazam {
 
     template <memory_mode Mode>
     concept fixed_like_mode = fixed_mode<Mode> || noheap_mode<Mode>;
+
+#if defined(__linux__)
+    inline constexpr bool explicit_huge_pages_supported = true;
+#else
+    inline constexpr bool explicit_huge_pages_supported = false;
+#endif
+
+    template <memory_mode Memory, allocation_model Allocation, huge_pages Huge>
+    concept supported_std_allocator_configuration = (Huge == huge_pages::disabled || explicit_huge_pages_supported) &&
+                                                    (Memory != memory_mode::noheap || Huge == huge_pages::disabled) &&
+                                                    (Allocation == allocation_model::suballocated ||
+                                                     (Allocation == allocation_model::exclusive &&
+                                                      (Memory == memory_mode::fixed || Memory == memory_mode::noheap)));
 
     template <typename T, memory_mode Mode = memory_mode::fixed, bool OwnerHeaders = false>
     class allocazam {
@@ -371,14 +386,20 @@ namespace allocazam {
     // - runs_override: rebound from another allocator; pinned to that allocator's runner
     enum class resource_mode : uint8_t { default_state, explicit_state, runs_override };
 
-    template <typename T, memory_mode Mode = memory_mode::dynamic, huge_pages Huge = huge_pages::disabled>
+    template <
+            typename T,
+            memory_mode Mode = memory_mode::dynamic,
+            allocation_model Allocation = allocation_model::suballocated,
+            huge_pages Huge = huge_pages::disabled>
+        requires supported_std_allocator_configuration<Mode, Allocation, Huge>
     struct allocazam_std_state;
 
     // heap-backed std_state pools are headered: they are the routable targets of
     // owner-routed deallocation. noheap stays raw — external backing cannot guarantee
     // granule alignment, and noheap states are explicit-only (unreachable by routing)
     template <typename T, huge_pages Huge>
-    struct alignas(detail::cache_line_size) allocazam_std_state<T, memory_mode::fixed, Huge> {
+    struct alignas(detail::cache_line_size)
+            allocazam_std_state<T, memory_mode::fixed, allocation_model::suballocated, Huge> {
         allocazam<T, memory_mode::fixed, true> pool;
         runner::allocator<false, false, Huge> runs;
         // intrusive link for the thread-state registry (default-created states only)
@@ -392,7 +413,8 @@ namespace allocazam {
     };
 
     template <typename T, huge_pages Huge>
-    struct alignas(detail::cache_line_size) allocazam_std_state<T, memory_mode::dynamic, Huge> {
+    struct alignas(detail::cache_line_size)
+            allocazam_std_state<T, memory_mode::dynamic, allocation_model::suballocated, Huge> {
         allocazam<T, memory_mode::dynamic, true> pool;
         runner::allocator<true, false, Huge> runs;
         // intrusive link for the thread-state registry (default-created states only)
@@ -405,7 +427,8 @@ namespace allocazam {
     };
 
     template <typename T, huge_pages Huge>
-    struct alignas(detail::cache_line_size) allocazam_std_state<T, memory_mode::noheap, Huge> {
+    struct alignas(detail::cache_line_size)
+            allocazam_std_state<T, memory_mode::noheap, allocation_model::suballocated, Huge> {
         allocazam<T, memory_mode::noheap> pool;
         runner::allocator<false, false, Huge> runs;
 
@@ -418,11 +441,122 @@ namespace allocazam {
                           backing.subspan(backing.size() / 2, backing.size() - (backing.size() / 2))) {}
     };
 
-    template <typename T, memory_mode Mode = memory_mode::dynamic, huge_pages Huge = huge_pages::disabled>
-    class allocazam_std_allocator {
+    template <typename T, huge_pages Huge>
+    struct allocazam_std_state<T, memory_mode::fixed, allocation_model::exclusive, Huge> {
+        explicit allocazam_std_state(size_t element_capacity) : allocazam_std_state{_config_for(element_capacity)} {}
+
+        allocazam_std_state(const allocazam_std_state&) = delete;
+        allocazam_std_state& operator=(const allocazam_std_state&) = delete;
+        allocazam_std_state(allocazam_std_state&&) = delete;
+        allocazam_std_state& operator=(allocazam_std_state&&) = delete;
+
+        [[nodiscard]] size_t capacity() const noexcept { return _element_capacity; }
+        [[nodiscard]] size_t capacity_bytes() const noexcept { return _resource.capacity_bytes(); }
+        [[nodiscard]] size_t mapping_bytes() const noexcept { return _backing.bytes(); }
+        [[nodiscard]] bool claimed() const noexcept { return _resource.claimed(); }
+
+      private:
+        struct config {
+            size_t element_capacity;
+            size_t usable_bytes;
+        };
+
+        [[nodiscard]] static config _config_for(size_t element_capacity) {
+            if (element_capacity == 0) {
+                throw std::invalid_argument{"exclusive state capacity must not be zero"};
+            }
+
+            size_t usable_bytes = 0;
+            if (!detail::checked_mul(element_capacity, sizeof(T), usable_bytes)) {
+                throw std::bad_array_new_length{};
+            }
+            return {.element_capacity = element_capacity, .usable_bytes = usable_bytes};
+        }
+
+        explicit allocazam_std_state(config cfg)
+                : _backing{cfg.usable_bytes, std::ranges::max(alignof(T), alignof(std::max_align_t))},
+                  _resource{_backing.base(), cfg.usable_bytes, _backing.alignment()},
+                  _element_capacity{cfg.element_capacity} {}
+
+        template <typename U, memory_mode OtherMode, allocation_model OtherAllocation, huge_pages OtherHuge>
+            requires supported_std_allocator_configuration<OtherMode, OtherAllocation, OtherHuge>
+        friend class allocazam_std_allocator;
+
+        detail::owned_memory_owner<Huge> _backing;
+        detail::exclusive_resource _resource;
+        size_t _element_capacity;
+    };
+
+    template <typename T>
+    struct allocazam_std_state<T, memory_mode::noheap, allocation_model::exclusive, huge_pages::disabled> {
+        explicit allocazam_std_state(std::span<std::byte> backing) : allocazam_std_state{_config_for(backing)} {}
+
+        allocazam_std_state(const allocazam_std_state&) = delete;
+        allocazam_std_state& operator=(const allocazam_std_state&) = delete;
+        allocazam_std_state(allocazam_std_state&&) = delete;
+        allocazam_std_state& operator=(allocazam_std_state&&) = delete;
+
+        [[nodiscard]] size_t capacity() const noexcept { return _element_capacity; }
+        [[nodiscard]] size_t capacity_bytes() const noexcept { return _resource.capacity_bytes(); }
+        [[nodiscard]] bool claimed() const noexcept { return _resource.claimed(); }
+
+      private:
+        struct config {
+            std::byte* base;
+            size_t usable_bytes;
+            size_t alignment;
+            size_t element_capacity;
+        };
+
+        [[nodiscard]] static config _config_for(std::span<std::byte> backing) {
+            if (backing.empty()) {
+                throw std::invalid_argument{"exclusive state backing must not be empty"};
+            }
+
+            constexpr size_t required_alignment = std::ranges::max(alignof(T), alignof(std::max_align_t));
+            void* aligned = backing.data();
+            size_t space = backing.size();
+            if (std::align(required_alignment, sizeof(T), aligned, space) == nullptr) {
+                throw std::invalid_argument{"exclusive state backing cannot satisfy value alignment"};
+            }
+
+            size_t element_capacity = space / sizeof(T);
+            if (element_capacity == 0) {
+                throw std::invalid_argument{"exclusive state backing is too small for one value"};
+            }
+            size_t usable_bytes = element_capacity * sizeof(T);
+            return {
+                    .base = static_cast<std::byte*>(aligned),
+                    .usable_bytes = usable_bytes,
+                    .alignment = required_alignment,
+                    .element_capacity = element_capacity,
+            };
+        }
+
+        explicit allocazam_std_state(config cfg)
+                : _resource{cfg.base, cfg.usable_bytes, cfg.alignment}, _element_capacity{cfg.element_capacity} {}
+
+        template <typename U, memory_mode OtherMode, allocation_model OtherAllocation, huge_pages OtherHuge>
+            requires supported_std_allocator_configuration<OtherMode, OtherAllocation, OtherHuge>
+        friend class allocazam_std_allocator;
+
+        detail::exclusive_resource _resource;
+        size_t _element_capacity;
+    };
+
+    template <
+            typename T,
+            memory_mode Mode = memory_mode::dynamic,
+            allocation_model Allocation = allocation_model::suballocated,
+            huge_pages Huge = huge_pages::disabled>
+        requires supported_std_allocator_configuration<Mode, Allocation, Huge>
+    class allocazam_std_allocator;
+
+    template <typename T, memory_mode Mode, huge_pages Huge>
+    class allocazam_std_allocator<T, Mode, allocation_model::suballocated, Huge> {
       public:
         using value_type = T;
-        using state_type = allocazam_std_state<T, Mode, Huge>;
+        using state_type = allocazam_std_state<T, Mode, allocation_model::suballocated, Huge>;
         using runs_type = std::conditional_t<
                 dynamic_mode<Mode>,
                 runner::allocator<true, false, Huge>,
@@ -445,7 +579,7 @@ namespace allocazam {
 
         template <typename U>
         struct rebind {
-            using other = allocazam_std_allocator<U, Mode, Huge>;
+            using other = allocazam_std_allocator<U, Mode, allocation_model::suballocated, Huge>;
         };
 
         // stateless: the calling thread's state is resolved per call (created on first
@@ -462,7 +596,8 @@ namespace allocazam {
         // bind neither U's default pool (violates confinement) nor the source's state
         // (wrong type)
         template <typename U>
-        constexpr allocazam_std_allocator(const allocazam_std_allocator<U, Mode, Huge>& other) noexcept
+        constexpr allocazam_std_allocator(
+                const allocazam_std_allocator<U, Mode, allocation_model::suballocated, Huge>& other) noexcept
                 : _state{nullptr}, _runs_override{nullptr}, _mode{resource_mode::default_state} {
             if (other._mode != resource_mode::default_state) {
                 _runs_override = other._runs_ptr();
@@ -472,7 +607,9 @@ namespace allocazam {
         }
 
         template <typename U>
-        constexpr allocazam_std_allocator(const allocazam_std_allocator<U, Mode, Huge>&, state_type& state) noexcept
+        constexpr allocazam_std_allocator(
+                const allocazam_std_allocator<U, Mode, allocation_model::suballocated, Huge>&,
+                state_type& state) noexcept
                 : _state{&state}, _runs_override{nullptr}, _mode{resource_mode::explicit_state} {}
 
         [[nodiscard]] T* allocate(size_t n) {
@@ -581,8 +718,11 @@ namespace allocazam {
             assert(_has_allocation_resource() && "allocator state must be initialized");
 
             if (_mode == resource_mode::default_state) {
-                // the four-case classifier — sound against byte collisions, race-free at
-                // every step. expansion is an optimization; callers fall back to relocate
+                // the four-case classifier — sound against byte collisions; every step
+                // either touches local-only state or is validated before use. the one
+                // formal wart is the owner-word probe itself (race-mitigated, not
+                // race-free — see runner::owner_of). expansion is an optimization;
+                // callers fall back to relocate
                 state_type* local = _local_state_or_null();
                 if (local == nullptr) {
                     return 0;
@@ -656,7 +796,8 @@ namespace allocazam {
         }
 
       private:
-        template <typename U, memory_mode OtherMode, huge_pages OtherHuge>
+        template <typename U, memory_mode OtherMode, allocation_model OtherAllocation, huge_pages OtherHuge>
+            requires supported_std_allocator_configuration<OtherMode, OtherAllocation, OtherHuge>
         friend class allocazam_std_allocator;
 
         struct tls_run_node {
@@ -980,6 +1121,153 @@ namespace allocazam {
         state_type* _state{nullptr};
         runs_type* _runs_override{nullptr};
         resource_mode _mode{resource_mode::explicit_state};
+    };
+
+    template <typename T, memory_mode Mode, huge_pages Huge>
+        requires fixed_like_mode<Mode>
+    class allocazam_std_allocator<T, Mode, allocation_model::exclusive, Huge> {
+      public:
+        using value_type = T;
+        using state_type = allocazam_std_state<T, Mode, allocation_model::exclusive, Huge>;
+
+        using propagate_on_container_copy_assignment = std::false_type;
+        using propagate_on_container_move_assignment = std::true_type;
+        using propagate_on_container_swap = std::true_type;
+        using is_always_equal = std::false_type;
+
+#if defined(__cpp_lib_allocate_at_least)
+        using allocate_at_least_result = std::allocation_result<T*>;
+#else
+        struct allocate_at_least_result {
+            T* ptr;
+            size_t count;
+        };
+#endif
+
+        template <typename U>
+        struct rebind {
+            using other = allocazam_std_allocator<U, Mode, allocation_model::exclusive, Huge>;
+        };
+
+        constexpr explicit allocazam_std_allocator(state_type& state) noexcept : _resource{&state._resource} {}
+
+        constexpr allocazam_std_allocator(const allocazam_std_allocator&) noexcept = default;
+        constexpr allocazam_std_allocator& operator=(const allocazam_std_allocator&) noexcept = default;
+        constexpr allocazam_std_allocator(allocazam_std_allocator&&) noexcept = default;
+        constexpr allocazam_std_allocator& operator=(allocazam_std_allocator&&) noexcept = default;
+
+        template <typename U>
+        constexpr allocazam_std_allocator(
+                const allocazam_std_allocator<U, Mode, allocation_model::exclusive, Huge>& other) noexcept
+                : _resource{other._resource} {}
+
+        [[nodiscard]] T* allocate(size_t n) {
+            if (n == 0) {
+                return nullptr;
+            }
+            if (n > _theoretical_max_size()) {
+                throw std::bad_array_new_length{};
+            }
+
+            size_t bytes = 0;
+            if (!detail::checked_mul(n, sizeof(T), bytes)) {
+                throw std::bad_array_new_length{};
+            }
+            void* raw = _resource->claim(bytes, bytes, alignof(T));
+            if (raw == nullptr) {
+                throw std::bad_alloc{};
+            }
+            return static_cast<T*>(raw);
+        }
+
+        [[nodiscard]] allocate_at_least_result allocate_at_least(size_t n) {
+            if (n == 0) {
+                return {nullptr, 0};
+            }
+            if (n > _theoretical_max_size()) {
+                throw std::bad_array_new_length{};
+            }
+
+            size_t minimum_bytes = 0;
+            if (!detail::checked_mul(n, sizeof(T), minimum_bytes)) {
+                throw std::bad_array_new_length{};
+            }
+
+            size_t returned_count = _resource->capacity_bytes() / sizeof(T);
+            if (n > returned_count || alignof(T) > _resource->alignment()) {
+                throw std::bad_alloc{};
+            }
+            size_t maximum_bytes = returned_count * sizeof(T);
+            void* raw = _resource->claim(minimum_bytes, maximum_bytes, alignof(T));
+            if (raw == nullptr) {
+                throw std::bad_alloc{};
+            }
+            return {static_cast<T*>(raw), returned_count};
+        }
+
+        void deallocate(T* pointer, size_t n) noexcept {
+            if (pointer == nullptr && n == 0) {
+                return;
+            }
+            if (pointer == nullptr || n == 0) {
+                assert(false && "exclusive allocator requires matching pointer and count");
+                return;
+            }
+
+            size_t bytes = 0;
+            bool valid_count = detail::checked_mul(n, sizeof(T), bytes);
+            assert(valid_count && "exclusive allocator deallocation count overflow");
+            if (!valid_count) {
+                return;
+            }
+            _resource->release(static_cast<void*>(pointer), bytes, alignof(T));
+        }
+
+        [[nodiscard]] size_t expand(T* pointer, size_t minimum_new_bytes) noexcept {
+            size_t representable_capacity_bytes = (_resource->capacity_bytes() / sizeof(T)) * sizeof(T);
+            return _resource->expand(static_cast<void*>(pointer), minimum_new_bytes, representable_capacity_bytes);
+        }
+
+        [[nodiscard]] size_t expand(void* pointer, size_t minimum_new_bytes) noexcept {
+            return expand(static_cast<T*>(pointer), minimum_new_bytes);
+        }
+
+        template <typename U, typename... Args>
+        constexpr void construct(U* pointer, Args&&... args) {
+            std::construct_at(pointer, std::forward<Args>(args)...);
+        }
+
+        template <typename U>
+        constexpr void destroy(U* pointer) {
+            std::destroy_at(pointer);
+        }
+
+        [[nodiscard]] constexpr size_t max_size() const noexcept {
+            return alignof(T) <= _resource->alignment() ? _resource->capacity_bytes() / sizeof(T) : 0;
+        }
+
+        template <typename U>
+        [[nodiscard]] constexpr bool operator==(
+                const allocazam_std_allocator<U, Mode, allocation_model::exclusive, Huge>& other) const noexcept {
+            return _resource == other._resource;
+        }
+
+        template <typename U>
+        [[nodiscard]] constexpr bool operator!=(
+                const allocazam_std_allocator<U, Mode, allocation_model::exclusive, Huge>& other) const noexcept {
+            return !(*this == other);
+        }
+
+      private:
+        template <typename U, memory_mode OtherMode, allocation_model OtherAllocation, huge_pages OtherHuge>
+            requires supported_std_allocator_configuration<OtherMode, OtherAllocation, OtherHuge>
+        friend class allocazam_std_allocator;
+
+        [[nodiscard]] static constexpr size_t _theoretical_max_size() noexcept {
+            return static_cast<size_t>(-1) / sizeof(T);
+        }
+
+        detail::exclusive_resource* _resource;
     };
 
 }  // namespace allocazam

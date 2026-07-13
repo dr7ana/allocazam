@@ -42,3 +42,14 @@ inline constexpr std::string_view memory_mode_to_string(allocazam::memory_mode m
     }
     return "unknown"sv;
 }
+
+inline constexpr std::string_view allocation_model_to_string(allocazam::allocation_model model) noexcept {
+    using namespace std::string_view_literals;
+    switch (model) {
+        case allocazam::allocation_model::suballocated:
+            return "suballocated"sv;
+        case allocazam::allocation_model::exclusive:
+            return "exclusive"sv;
+    }
+    return "unknown"sv;
+}

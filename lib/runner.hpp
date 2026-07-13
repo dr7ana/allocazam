@@ -1,24 +1,12 @@
 #pragma once
 
+#include "owned_memory.hpp"
 #include "types.hpp"
 
 #include <atomic>
 #include <cstring>
-#include <expected>
 #include <limits>
 #include <span>
-
-#if defined(__linux__)
-#include <sys/mman.h>
-
-#ifndef MAP_HUGE_SHIFT
-#define MAP_HUGE_SHIFT 26
-#endif
-
-#ifndef MAP_HUGE_2MB
-#define MAP_HUGE_2MB (21U << MAP_HUGE_SHIFT)
-#endif
-#endif
 
 namespace allocazam { namespace runner {
     template <bool CanGrow, bool CollectStats = false, huge_pages Huge = huge_pages::disabled>
@@ -50,16 +38,6 @@ namespace allocazam { namespace runner {
             chunk_node* next;
         };
 
-        struct owned_arena {
-            std::byte* base;
-            size_t bytes;
-        };
-
-        enum class arena_error : uint8_t {
-            out_of_memory,
-            hugetlb_failed,
-        };
-
         static constexpr size_t run_alignment{alignof(std::max_align_t)};
         static constexpr size_t min_bin_shift{3};
         static constexpr size_t min_bin_bytes{size_t{1} << min_bin_shift};
@@ -84,7 +62,6 @@ namespace allocazam { namespace runner {
         static constexpr bool can_grow{CanGrow};
         static constexpr bool collect_stats{CollectStats};
         static constexpr bool use_huge_pages{Huge == huge_pages::enabled};
-        static constexpr size_t explicit_huge_page_bytes{size_t{2} << 20};
 
       public:
         struct stats_t {
@@ -204,8 +181,13 @@ namespace allocazam { namespace runner {
         // the run is allocated; publication rides the synchronization that handed the
         // payload pointer across threads. never read size_and_flags from a foreign thread.
         // relaxed atomic load: when the classifier probes a pointer that is NOT a run
-        // payload, these bytes may be foreign live data — the probe must not be a data
-        // race, and the value is only compared, then validated against local chunk ranges
+        // payload, these bytes may be foreign live data. the atomic_ref makes the PROBE
+        // side atomic, but a concurrent plain write to those foreign bytes (arbitrary user
+        // data — it cannot be made atomic) is still, formally, a data race; this is
+        // race-mitigated, not race-free, and is the same accepted mitigation mimalloc
+        // uses. TSan can flag the plain-write side if that interleaving is ever exercised.
+        // the loaded value is never trusted: it is only compared, then validated against
+        // local chunk ranges before any header surgery
         [[nodiscard]] static allocator* owner_of(void* payload) noexcept {
             auto* slot = reinterpret_cast<allocator**>(static_cast<std::byte*>(payload) - sizeof(allocator*));
             return std::atomic_ref<allocator*>{*slot}.load(std::memory_order_relaxed);
@@ -352,7 +334,7 @@ namespace allocazam { namespace runner {
 
         [[nodiscard]] constexpr size_t _owned_chunk_granularity() const noexcept {
             if constexpr (use_huge_pages) {
-                return explicit_huge_page_bytes;
+                return detail::explicit_huge_page_bytes;
             } else {
                 return _page_size;
             }
@@ -365,52 +347,6 @@ namespace allocazam { namespace runner {
                 throw std::bad_alloc{};
             }
             return chunk_bytes;
-        }
-
-        [[nodiscard]] static std::expected<owned_arena, arena_error> _allocate_owned_arena(
-                size_t chunk_bytes) noexcept {
-            if constexpr (use_huge_pages) {
-#if defined(__linux__)
-                void* mapping =
-                        ::mmap(nullptr,
-                               chunk_bytes,
-                               PROT_READ | PROT_WRITE,
-                               MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_HUGE_2MB,
-                               -1,
-                               0);
-                if (mapping == MAP_FAILED) {
-                    return std::unexpected{arena_error::hugetlb_failed};
-                }
-                return owned_arena{static_cast<std::byte*>(mapping), chunk_bytes};
-#else
-                (void)chunk_bytes;
-                return std::unexpected{arena_error::hugetlb_failed};
-#endif
-            } else {
-                auto* raw = static_cast<std::byte*>(
-                        ::operator new[](chunk_bytes, std::align_val_t{run_alignment}, std::nothrow));
-                if (raw == nullptr) {
-                    return std::unexpected{arena_error::out_of_memory};
-                }
-                return owned_arena{raw, chunk_bytes};
-            }
-        }
-
-        static void _release_owned_arena(std::byte* mapping_base, size_t mapping_bytes) noexcept {
-            if (mapping_base == nullptr) {
-                return;
-            }
-
-            if constexpr (use_huge_pages) {
-#if defined(__linux__)
-                ::munmap(static_cast<void*>(mapping_base), mapping_bytes);
-#else
-                (void)mapping_bytes;
-#endif
-            } else {
-                (void)mapping_bytes;
-                ::operator delete[](mapping_base, std::align_val_t{run_alignment});
-            }
         }
 
         static constexpr bool _normalized_run_bytes_for_payload(size_t payload_bytes, size_t& out) noexcept {
@@ -727,7 +663,7 @@ namespace allocazam { namespace runner {
         [[nodiscard]] size_t _add_owned_chunk(size_t bytes) {
             size_t chunk_bytes = _owned_chunk_bytes_for(bytes);
             auto* c = new chunk_node{};
-            std::expected<owned_arena, arena_error> arena = _allocate_owned_arena(chunk_bytes);
+            auto arena = detail::allocate_owned_memory<Huge>(chunk_bytes, run_alignment);
             if (!arena) {
                 delete c;
                 throw std::bad_alloc{};
@@ -774,7 +710,11 @@ namespace allocazam { namespace runner {
             for (chunk_node* c = _chunks_head; c != nullptr;) {
                 chunk_node* next = c->next;
                 if (c->mapping_base != nullptr) {
-                    _release_owned_arena(c->mapping_base, c->mapping_bytes);
+                    detail::release_owned_memory<Huge>({
+                            .base = c->mapping_base,
+                            .bytes = c->mapping_bytes,
+                            .alignment = use_huge_pages ? detail::explicit_huge_page_bytes : run_alignment,
+                    });
                     delete c;
                 }
                 c = next;

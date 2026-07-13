@@ -18,6 +18,7 @@
 namespace allocazam {
     //
     enum class memory_mode : uint8_t { fixed, dynamic, noheap };
+    enum class allocation_model : uint8_t { suballocated, exclusive };
     enum class huge_pages : uint8_t { disabled, enabled };
 
     // defers the first chunk to first allocation. default-created thread states use this

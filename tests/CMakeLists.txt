@@ -20,3 +20,18 @@ add_executable(allocazam_concurrent_stress concurrent_stress.cpp)
 target_link_libraries(allocazam_concurrent_stress PUBLIC liballocazam)
 target_include_directories(allocazam_concurrent_stress PRIVATE ${PROJECT_SOURCE_DIR}/bench)
 set_target_properties(allocazam_concurrent_stress PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(allocazam_owned_memory_smoke owned_memory_smoke.cpp)
+target_link_libraries(allocazam_owned_memory_smoke PUBLIC liballocazam)
+target_include_directories(allocazam_owned_memory_smoke PRIVATE ${PROJECT_SOURCE_DIR}/bench)
+set_target_properties(allocazam_owned_memory_smoke PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(allocazam_exclusive_resource_smoke exclusive_resource_smoke.cpp)
+target_link_libraries(allocazam_exclusive_resource_smoke PUBLIC liballocazam)
+target_include_directories(allocazam_exclusive_resource_smoke PRIVATE ${PROJECT_SOURCE_DIR}/bench)
+set_target_properties(allocazam_exclusive_resource_smoke PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(allocazam_exclusive_allocator_smoke exclusive_allocator_smoke.cpp)
+target_link_libraries(allocazam_exclusive_allocator_smoke PUBLIC liballocazam)
+target_include_directories(allocazam_exclusive_allocator_smoke PRIVATE ${PROJECT_SOURCE_DIR}/bench)
+set_target_properties(allocazam_exclusive_allocator_smoke PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)

@@ -1,4 +1,10 @@
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
+
+cc_library(
+    name = "mapping_info",
+    hdrs = ["mapping_info.hpp"],
+)
 
 cc_test(
     name = "std_allocator_smoke",
@@ -13,6 +19,7 @@ cc_test(
     name = "runner_expand_smoke",
     srcs = ["runner_expand_smoke.cpp"],
     deps = [
+        ":mapping_info",
         "//:liballocazam",
         "//bench:bench_utils",
     ],
@@ -22,6 +29,7 @@ cc_test(
     name = "std_allocator_expand_smoke",
     srcs = ["std_allocator_expand_smoke.cpp"],
     deps = [
+        ":mapping_info",
         "//:liballocazam",
         "//bench:bench_utils",
     ],
@@ -31,6 +39,34 @@ cc_test(
     name = "concurrent_stress",
     srcs = ["concurrent_stress.cpp"],
     deps = [
+        "//:liballocazam",
+        "//bench:bench_utils",
+    ],
+)
+
+cc_test(
+    name = "owned_memory_smoke",
+    srcs = ["owned_memory_smoke.cpp"],
+    deps = [
+        "//:liballocazam",
+        "//bench:bench_utils",
+    ],
+)
+
+cc_test(
+    name = "exclusive_resource_smoke",
+    srcs = ["exclusive_resource_smoke.cpp"],
+    deps = [
+        "//:liballocazam",
+        "//bench:bench_utils",
+    ],
+)
+
+cc_test(
+    name = "exclusive_allocator_smoke",
+    srcs = ["exclusive_allocator_smoke.cpp"],
+    deps = [
+        ":mapping_info",
         "//:liballocazam",
         "//bench:bench_utils",
     ],

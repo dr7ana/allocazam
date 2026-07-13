@@ -78,3 +78,12 @@ cc_binary(
     srcs = ["vector_std_allocator_benchmark.cpp"],
     deps = [":std_allocator_bench_common"],
 )
+
+cc_binary(
+    name = "exclusive_allocator_benchmark",
+    srcs = ["exclusive_allocator_benchmark.cpp"],
+    deps = [
+        ":bench_utils",
+        "//:liballocazam",
+    ],
+)
